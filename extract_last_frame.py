@@ -43,48 +43,60 @@ def extract_last_frame(video_path, output_path=None, num_frames=1):
         print(f"警告: 请求提取 {num_frames} 帧，但视频只有 {total_frames} 帧，将提取所有帧")
         num_frames = total_frames
     
-    # 计算起始帧位置
-    start_frame = max(0, total_frames - num_frames)
-    
+    # 提取多帧 - 使用顺序读取方式，更可靠
     success_count = 0
+    frames_to_save = []
     
-    # 提取多帧
-    for i in range(num_frames):
-        frame_number = start_frame + i
-        
-        # 设置到指定帧
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
-        
-        # 读取帧
+    # 读取所有帧，保存最后num_frames帧
+    current_frame = 0
+    while True:
         ret, frame = cap.read()
-        
         if not ret:
-            print(f"错误: 无法读取第 {frame_number + 1} 帧")
-            continue
+            break
+        
+        # 保存当前帧，保持最多num_frames帧
+        frames_to_save.append(frame)
+        if len(frames_to_save) > num_frames:
+            frames_to_save.pop(0)
+        
+        current_frame += 1
+    
+    # 实际总帧数可能与cap.get(CAP_PROP_FRAME_COUNT)不同，使用实际读取的帧数
+    actual_total_frames = current_frame
+    print(f"实际读取帧数: {actual_total_frames}")
+    
+    # 保存最后几帧
+    # 先保存原始输出路径，避免循环中被修改
+    original_output_path = output_path
+    
+    for i in range(len(frames_to_save)):
+        frame = frames_to_save[i]
+        frame_number = actual_total_frames - len(frames_to_save) + i
         
         # 生成输出路径
-        if output_path is None:
+        current_output_path = None
+        if original_output_path is None:
             video_name = os.path.splitext(os.path.basename(video_path))[0]
-            output_path = f"{video_name}_last_{num_frames}_frames_{i+1}.jpg"
+            current_output_path = f"{video_name}_last_{num_frames}_frames_{i+1}.jpg"
         else:
             # 如果指定了输出路径，为多帧添加序号
-            base_name, ext = os.path.splitext(output_path)
-            output_path = f"{base_name}_{i+1}{ext}"
+            base_name, ext = os.path.splitext(original_output_path)
+            current_output_path = f"{base_name}_{i+1}{ext}"
         
         # 确保输出目录存在
-        output_dir = os.path.dirname(output_path)
+        output_dir = os.path.dirname(current_output_path)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
         
         # 保存图片
-        success = cv2.imwrite(output_path, frame)
+        success = cv2.imwrite(current_output_path, frame)
         
         if success:
-            print(f"成功提取第 {frame_number + 1} 帧到: {output_path}")
+            print(f"成功提取第 {frame_number + 1} 帧到: {current_output_path}")
             print(f"图片尺寸: {frame.shape[1]}x{frame.shape[0]}")
             success_count += 1
         else:
-            print(f"错误: 无法保存图片到 '{output_path}'")
+            print(f"错误: 无法保存图片到 '{current_output_path}'")
     
     print(f"成功提取 {success_count}/{num_frames} 帧")
     
