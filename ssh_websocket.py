@@ -49,7 +49,7 @@ class SSHSessionManager:
                         port=connection.port,
                         username=connection.username,
                         password=connection.password,
-                        timeout=10
+                        timeout=30  # 增加SSH连接超时时间
                     )
                 elif connection.key_file:
                     ssh.connect(
@@ -57,7 +57,7 @@ class SSHSessionManager:
                         port=connection.port,
                         username=connection.username,
                         key_filename=connection.key_file,
-                        timeout=10
+                        timeout=30  # 增加SSH连接超时时间
                     )
                 else:
                     raise ValueError("Either password or key_file must be provided")
@@ -119,40 +119,72 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
     try:
         # 接收连接信息
         connection_data = await websocket.receive_text()
+        print(f"接收到连接数据: {connection_data}")
+        
         connection_info = json.loads(connection_data)
         
         # 验证连接信息
-        if "type" not in connection_info or connection_info["type"] != "connect":
+        if "type" not in connection_info:
+            error_msg = "消息缺少type字段"
+            print(f"错误: {error_msg}")
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "message": "首次消息必须是连接类型"
+                "message": error_msg
+            }))
+            return
+        
+        if connection_info["type"] != "connect":
+            error_msg = f"首次消息必须是连接类型，当前类型: {connection_info['type']}"
+            print(f"错误: {error_msg}")
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": error_msg
             }))
             return
         
         # 验证data字段是否存在
         if "data" not in connection_info:
+            error_msg = "连接信息缺少data字段"
+            print(f"错误: {error_msg}")
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "message": "连接信息缺少data字段"
+                "message": error_msg
             }))
             return
         
         connection = SSHConnection(**connection_info["data"])
         session_id = app.state.ssh_manager.generate_session_id(connection)
+        print(f"生成会话ID: {session_id}")
         
         # 建立SSH连接
+        print(f"正在建立SSH连接: {connection.username}@{connection.hostname}:{connection.port}")
         ssh_client = app.state.ssh_manager.connect_ssh(connection)
         app.state.ssh_manager.register_websocket(session_id, websocket)
+        print(f"SSH连接成功")
         
         # 创建交互式shell通道
         channel = ssh_client.invoke_shell()
-        channel.settimeout(0.1)
+        channel.settimeout(1.0)  # 增加通道超时时间，提高稳定性
+        print(f"创建shell通道成功")
         
-        await websocket.send_text(json.dumps({
+        # 发送连接成功消息
+        # 发送 connected 类型消息（标准）
+        connected_response = {
             "type": "connected",
             "session_id": session_id,
             "message": "SSH连接成功"
-        }))
+        }
+        print(f"发送connected响应: {connected_response}")
+        await websocket.send_text(json.dumps(connected_response))
+        
+        # 同时发送 connect 类型消息（兼容某些客户端）
+        connect_response = {
+            "type": "connect",
+            "session_id": session_id,
+            "message": "SSH连接成功"
+        }
+        print(f"发送connect响应: {connect_response}")
+        await websocket.send_text(json.dumps(connect_response))
         
         # 启动数据接收任务
         async def receive_ssh_output():
@@ -202,9 +234,11 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                 }))
         
     except Exception as e:
+        error_msg = f"连接失败: {str(e)}"
+        print(f"发送错误消息: {error_msg}")
         await websocket.send_text(json.dumps({
             "type": "error",
-            "message": f"连接失败: {str(e)}"
+            "message": error_msg
         }))
     finally:
         # 清理资源
@@ -218,12 +252,16 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
 @app.websocket("/ws/ssh/execute")
 async def websocket_command_endpoint(websocket: WebSocket):
-    """WebSocket命令执行端点（单次命令）"""
+    """
+    WebSocket命令执行端点（单次命令）
+    """
     await websocket.accept()
+    print("WebSocket连接已接受")
     
     try:
         # 接收命令信息
         command_data = await websocket.receive_text()
+        print(f"接收到命令数据: {command_data}")
         command_info = json.loads(command_data)
         
         if "type" not in command_info or command_info["type"] != "execute":
