@@ -27,10 +27,64 @@ class SSHSessionManager:
     def __init__(self):
         self.sessions: Dict[str, paramiko.SSHClient] = {}
         self.websocket_connections: Dict[str, WebSocket] = {}
+        self.command_history: Dict[str, list] = {}  # 存储每个会话的命令历史
         self.lock = threading.Lock()
     
     def generate_session_id(self, connection: SSHConnection) -> str:
         return f"{connection.username}@{connection.hostname}:{connection.port}"
+    
+    def add_command_to_history(self, session_id: str, command: str):
+        """添加命令到历史记录"""
+        with self.lock:
+            # 确保只存储纯命令，不包含提示符
+            # 清理命令，移除可能的提示符（如：(base) root@VM-0-15-ubuntu:~# ls -la）
+            # 查找最后一个可能的提示符结束字符（# 或 $）
+            cleaned_command = command.strip()
+            
+            # 处理常见的Shell提示符模式
+            prompt_end_chars = ['#', '$', '>']
+            for char in prompt_end_chars:
+                if char in cleaned_command:
+                    # 只保留提示符后的内容
+                    cleaned_command = cleaned_command.split(char, 1)[-1].strip()
+                    break
+            
+            # 跳过空命令
+            if not cleaned_command:
+                return
+                
+            if session_id not in self.command_history:
+                self.command_history[session_id] = []
+            # 避免重复添加相同的命令
+            if not self.command_history[session_id] or self.command_history[session_id][-1] != cleaned_command:
+                self.command_history[session_id].append(cleaned_command)
+    
+    def get_history_command(self, session_id: str, direction: str, current_index: int) -> dict:
+        """获取历史命令
+        
+        Args:
+            session_id: 会话ID
+            direction: "up"或"down"
+            current_index: 当前历史索引
+            
+        Returns:
+            dict: 包含历史命令和新索引的字典
+        """
+        with self.lock:
+            history = self.command_history.get(session_id, [])
+            max_index = len(history) - 1
+            
+            if direction == "up":
+                # 向上箭头，获取上一个历史命令
+                new_index = current_index - 1 if current_index > 0 else max_index
+            elif direction == "down":
+                # 向下箭头，获取下一个历史命令
+                new_index = current_index + 1 if current_index < max_index else -1  # -1表示没有命令
+            else:
+                return {"command": "", "index": current_index}
+            
+            command = history[new_index] if new_index >= 0 else ""
+            return {"command": command, "index": new_index}
     
     def connect_ssh(self, connection: SSHConnection) -> paramiko.SSHClient:
         session_id = self.generate_session_id(connection)
@@ -214,6 +268,26 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     # 执行命令
                     command = message["data"]["command"]
                     channel.send(command + "\n")
+                    # 将命令添加到历史记录
+                    app.state.ssh_manager.add_command_to_history(session_id, command)
+                    
+                elif message["type"] == "tab_complete_result":
+                    # 处理TAB补全结果
+                    completion = message["data"]["completion"]
+                    channel.send(completion)
+                    
+                elif message["type"] == "history_get":
+                    # 处理历史命令请求
+                    data = message["data"]
+                    direction = data.get("direction", "up")
+                    current_index = data.get("current_index", -1)
+                    # 获取历史命令
+                    history_result = app.state.ssh_manager.get_history_command(session_id, direction, current_index)
+                    # 发送历史命令响应
+                    await websocket.send_text(json.dumps({
+                        "type": "history_result",
+                        "data": history_result
+                    }))
                     
                 elif message["type"] == "resize":
                     # 调整终端大小
@@ -236,19 +310,34 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
     except Exception as e:
         error_msg = f"连接失败: {str(e)}"
         print(f"发送错误消息: {error_msg}")
-        await websocket.send_text(json.dumps({
-            "type": "error",
-            "message": error_msg
-        }))
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": error_msg
+            }))
+        except Exception as send_error:
+            print(f"发送错误消息失败: {send_error}")
     finally:
         # 清理资源
         if 'receive_task' in locals() and receive_task:
             receive_task.cancel()
         if channel:
-            channel.close()
+            try:
+                channel.close()
+            except Exception as e:
+                print(f"关闭SSH通道失败: {e}")
         if session_id:
-            app.state.ssh_manager.disconnect_ssh(session_id)
-        await websocket.close()
+            try:
+                app.state.ssh_manager.disconnect_ssh(session_id)
+            except Exception as e:
+                print(f"断开SSH连接失败: {e}")
+        # 尝试关闭WebSocket连接，但处理已关闭的情况
+        try:
+            await websocket.close()
+        except Exception as close_error:
+            # 忽略连接已关闭的错误
+            if "Unexpected ASGI message" not in str(close_error):
+                print(f"关闭WebSocket连接失败: {close_error}")
 
 @app.websocket("/ws/ssh/execute")
 async def websocket_command_endpoint(websocket: WebSocket):
@@ -314,12 +403,21 @@ async def websocket_command_endpoint(websocket: WebSocket):
         await stream_output()
         
     except Exception as e:
-        await websocket.send_text(json.dumps({
-            "type": "error",
-            "message": f"执行命令时出错: {str(e)}"
-        }))
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": f"执行命令时出错: {str(e)}"
+            }))
+        except Exception as send_error:
+            print(f"发送错误消息失败: {send_error}")
     finally:
-        await websocket.close()
+        # 尝试关闭WebSocket连接，但处理已关闭的情况
+        try:
+            await websocket.close()
+        except Exception as close_error:
+            # 忽略连接已关闭的错误
+            if "Unexpected ASGI message" not in str(close_error):
+                print(f"关闭WebSocket连接失败: {close_error}")
 
 @app.get("/")
 async def root():
