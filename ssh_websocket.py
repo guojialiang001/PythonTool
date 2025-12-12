@@ -298,21 +298,14 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     
-    # SSL证书配置
-    ssl_config = {
-        "ssl_keyfile": "key.pem",  # SSL私钥文件路径
-        "ssl_certfile": "cert.pem",  # SSL证书文件路径
-        "ssl_keyfile_password": None,  # SSL私钥密码
-    }
-    
-    # 检查是否配置了SSL证书
-    use_ssl = True
+    # 禁用SSL证书
+    use_ssl = False
     
     uvicorn.run(
         app, 
         host="0.0.0.0", 
-        port=8002, 
+        port=8003, 
         ws_ping_timeout=None, 
         ws_ping_interval=None,
-        **ssl_config if use_ssl else {}
+        # 不使用SSL证书
     )
