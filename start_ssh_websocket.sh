@@ -29,6 +29,12 @@ fi
 echo "正在检查Python依赖..."
 pip install -r requirements.txt
 
+# 检查并生成SSL证书（如果不存在）
+if [ ! -f "key.pem" ] || [ ! -f "cert.pem" ]; then
+    echo "正在生成SSL证书..."
+    python generate_ssl.py
+fi
+
 # 停止已存在的服务（如果存在）
 echo "正在停止已存在的SSH WebSocket服务..."
 pm2 stop ssh-websocket 2>/dev/null || true
@@ -48,5 +54,6 @@ echo "  pm2 restart ssh-websocket # 重启服务"
 echo "  pm2 stop ssh-websocket    # 停止服务"
 echo "  pm2 delete ssh-websocket  # 删除服务"
 echo ""
-echo "WebSocket服务运行在: http://localhost:8002"
-echo "WebSocket端点: ws://localhost:8002/ws/ssh"
+echo "WebSocket服务运行在: https://localhost:8002"
+echo "WebSocket端点: wss://localhost:8002/ws/ssh"
+echo "注意: 由于使用自签名证书，浏览器会显示安全警告，请点击"继续前往""
