@@ -271,6 +271,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     # 将命令添加到历史记录
                     app.state.ssh_manager.add_command_to_history(session_id, command)
                     
+                elif message["type"] == "tab_complete":
+                    # 处理TAB补全请求，发送制表符到SSH通道
+                    channel.send("\t")
+                    
                 elif message["type"] == "tab_complete_result":
                     # 处理TAB补全结果
                     completion = message["data"]["completion"]
