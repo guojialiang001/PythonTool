@@ -16,6 +16,8 @@ class SSHConnection(BaseModel):
     username: str
     password: Optional[str] = None
     key_file: Optional[str] = None
+    width: Optional[int] = 80
+    height: Optional[int] = 24
 
 # WebSocket消息类型
 class WebSocketMessage(BaseModel):
@@ -266,7 +268,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         print(f"SSH连接成功")
         
         # 创建交互式shell通道，配置终端类型和模式
-        channel = ssh_client.invoke_shell(term='xterm', width=80, height=24)
+        channel = ssh_client.invoke_shell(term='xterm', width=connection.width, height=connection.height)
         channel.settimeout(1.0)  # 增加通道超时时间，提高稳定性
         print(f"创建shell通道成功")
         
@@ -290,10 +292,13 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         await websocket.send_text(json.dumps(connect_response))
         
         # 启动数据接收任务
+        output_paused = asyncio.Event()
+        output_paused.set() # Initially, output is not paused
+
         async def receive_ssh_output():
             while True:
                 try:
-                    if channel.recv_ready():
+                    if channel.recv_ready() and output_paused.is_set():
                         data = channel.recv(1024).decode('utf-8', errors='ignore')
                         if data:
                             # 过滤服务器回显的命令，避免重复显示
@@ -321,7 +326,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 filtered = []
                                 drop_prefixes = [
                                     'Memory usage:',
-                                    'IPv4 address for '
+                                    'IPv4 address for ',
+                                    'System load:'
                                 ]
                                 for orig, s in zip(lines, stripped_lines):
                                     s = s.strip()
@@ -338,19 +344,16 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 pass
 
                             # 发送过滤后的输出
-                            import time as _time
-                            if _time.time() >= suppress_output_until:
-                                await websocket.send_text(json.dumps({
-                                    "type": "output",
-                                    "data": data
-                                }))
+                            await websocket.send_text(json.dumps({
+                                "type": "output",
+                                "data": data
+                            }))
                     await asyncio.sleep(0.01)
                 except:
                     break
         
         receive_task = asyncio.create_task(receive_ssh_output())
         last_sent_command = None
-        suppress_output_until = 0
         tab_last_command = ""
         tab_last_options = []
         tab_cycle_index = -1
@@ -383,8 +386,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         context_command = message["data"]["command"]
                     
                     if context_command:
+                        output_paused.clear()
                         try:
-                            suppress_output_until = time.time() + 1.0
                             # 获取当前猜测的CWD
                             cwd = app.state.ssh_manager.get_cwd(session_id)
                             
@@ -488,6 +491,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     "error": str(e)
                                 }
                             }))
+                        finally:
+                            # 无论如何，恢复输出
+                            await asyncio.sleep(0.1) # 等待一小段时间，让可能的垃圾输出被丢弃
+                            output_paused.set()
                     else:
                         await websocket.send_text(json.dumps({
                             "type": "tab_completion_options",
