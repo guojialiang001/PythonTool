@@ -36,7 +36,7 @@ class SSHSessionManager:
     def generate_session_id(self, connection: SSHConnection) -> str:
         return f"{connection.username}@{connection.hostname}:{connection.port}"
     
-    def update_cwd(self, session_id: str, command: str):
+    def update_cwd(self, session_id: str, command: str, ssh_client: paramiko.SSHClient = None):
         """尝试从命令中更新当前工作目录"""
         with self.lock:
             # 简单的cd命令解析
@@ -60,11 +60,20 @@ class SSHSessionManager:
                 elif path == '~':
                     self.cwd_cache[session_id] = '~'
                 elif path == '..':
-                    # 修复：正确处理上一级目录
+                    # 修复：正确处理上一级目录 - 增强版
                     if current == '~':
                         # 从主目录返回，需要获取实际的主目录路径
-                        # 这里我们假设主目录为 /home/username，实际应该查询
-                        self.cwd_cache[session_id] = '/home'  # 简化处理
+                        # 通过SSH执行pwd命令获取真实路径
+                        try:
+                            stdin, stdout, stderr = ssh_client.exec_command("pwd", timeout=5)
+                            real_home = stdout.read().decode('utf-8', errors='ignore').strip()
+                            if real_home:
+                                parent = os.path.dirname(real_home)
+                                self.cwd_cache[session_id] = parent or '/'
+                            else:
+                                self.cwd_cache[session_id] = '/home'  # 回退方案
+                        except:
+                            self.cwd_cache[session_id] = '/home'  # 回退方案
                     elif current == '/':
                         # 已经在根目录，保持不变
                         pass
@@ -703,16 +712,15 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 await websocket.send_text(json.dumps(ls_structured))
                                 
                                 # 发送提示符（模拟命令执行完成）
-                                # 修复：移除多余换行，确保格式正确
-                                prompt_text = ls_structured["data"]["prompt"].lstrip('\n')
-                                if not prompt_text.startswith('\n') and prompt_text != '':
-                                    prompt_text = '\n' + prompt_text
-                                
-                                prompt_response = {
-                                    "type": "output",
-                                    "data": prompt_text
-                                }
-                                await websocket.send_text(json.dumps(prompt_response))
+                                # 修复：避免输出重叠和多余换行
+                                prompt_text = ls_structured["data"]["prompt"].strip()
+                                if prompt_text:
+                                    # 确保只有一个换行在开头，避免重叠
+                                    prompt_response = {
+                                        "type": "output", 
+                                        "data": "\n" + prompt_text
+                                    }
+                                    await websocket.send_text(json.dumps(prompt_response))
                                 
                                 # 跳过正常命令执行流程
                                 continue
@@ -739,8 +747,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     channel.send(command + "\n")
                     # 将命令添加到历史记录
                     app.state.ssh_manager.add_command_to_history(session_id, command)
-                    # 尝试更新CWD
-                    app.state.ssh_manager.update_cwd(session_id, command)
+                    # 尝试更新CWD（传入ssh_client用于cd ..命令）
+                    app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
                 elif message["type"] == "resize":
                     # 处理终端尺寸调整
                     if "data" in message and isinstance(message["data"], dict):
