@@ -383,7 +383,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 # 文件/目录补全
                                 # 采用更可靠的策略：列出当前目录所有文件，在Python端过滤
                                 # 使用 ls -1F，目录会以 / 结尾，可执行文件以 * 结尾等
-                                ls_cmd = "ls -1F"
+                                ls_cmd = "ls -1F --color=never"
                                 if cwd != '~':
                                     ls_cmd = f"cd {cwd} && {ls_cmd}"
                                 
@@ -391,9 +391,12 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 # 直接执行，不使用 bash -c 包装，减少转义问题
                                 stdin, stdout, stderr = ssh_client.exec_command(ls_cmd, timeout=5)
                                 
-                                out_data = stdout.read().decode('utf-8', errors='ignore')
+                                out_raw = stdout.read().decode('utf-8', errors='ignore')
                                 err_data = stderr.read().decode('utf-8', errors='ignore')
                                 
+                                import re
+                                ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+                                out_data = ansi.sub('', out_raw)
                                 all_files = [c.strip() for c in out_data.split('\n') if c.strip()]
                                 
                                 # 在 Python 端进行过滤
@@ -417,6 +420,20 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                             completions.append(f)
 
                             print(f"补全结果: {len(completions)} 个候选项")
+                            
+                            # 如果无结果，尝试在根目录回退一次（适配用户在 / 下的情况）
+                            if not completions and not is_command_completion and args and args[0] == 'cd':
+                                try:
+                                    ls_root = "ls -1F --color=never /"
+                                    stdin, stdout, stderr = ssh_client.exec_command(ls_root, timeout=5)
+                                    out_root_raw = stdout.read().decode('utf-8', errors='ignore')
+                                    out_root = ansi.sub('', out_root_raw)
+                                    root_files = [c.strip() for c in out_root.split('\n') if c.strip()]
+                                    filtered = [f for f in root_files if f.startswith(last_word) and f.endswith('/')]
+                                    completions = [f[:-1] for f in filtered]
+                                    print(f"根目录回退补全: {len(completions)} 个候选项")
+                                except Exception as _:
+                                    pass
                             
                             # 发送补全选项给前端
                             await websocket.send_text(json.dumps({
