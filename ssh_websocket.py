@@ -302,7 +302,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         data = channel.recv(1024).decode('utf-8', errors='ignore')
                         if data:
                             # 过滤服务器回显的命令，避免重复显示
-                            nonlocal last_sent_command, suppress_output_until
+                            nonlocal last_sent_command
                             if last_sent_command:
                                 # 处理命令回显，考虑ANSI转义序列
                                 # 先处理可能包含控制字符的情况
