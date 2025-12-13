@@ -28,11 +28,58 @@ class SSHSessionManager:
         self.sessions: Dict[str, paramiko.SSHClient] = {}
         self.websocket_connections: Dict[str, WebSocket] = {}
         self.command_history: Dict[str, list] = {}  # 存储每个会话的命令历史
+        self.cwd_cache: Dict[str, str] = {} # 存储每个会话的当前工作目录（猜测值）
         self.lock = threading.Lock()
     
     def generate_session_id(self, connection: SSHConnection) -> str:
         return f"{connection.username}@{connection.hostname}:{connection.port}"
     
+    def update_cwd(self, session_id: str, command: str):
+        """尝试从命令中更新当前工作目录"""
+        with self.lock:
+            # 简单的cd命令解析
+            parts = command.strip().split()
+            if not parts:
+                return
+                
+            # 处理连续命令，如 cd /tmp && ls
+            # 这里只做最简单的处理，假设命令以cd开头
+            if parts[0] == 'cd' and len(parts) > 1:
+                path = parts[1]
+                # 忽略复杂的情况，如变量等
+                if '$' in path or '`' in path:
+                    return
+                    
+                current = self.cwd_cache.get(session_id, '~')
+                
+                if path.startswith('/'):
+                    # 绝对路径
+                    self.cwd_cache[session_id] = path
+                elif path == '~':
+                    self.cwd_cache[session_id] = '~'
+                elif path == '..':
+                    # 简单处理上一级目录，实际上很复杂，这里只做字符串处理
+                    if current != '~' and current != '/':
+                        self.cwd_cache[session_id] = '/'.join(current.rstrip('/').split('/')[:-1]) or '/'
+                elif path == '.':
+                    pass
+                else:
+                    # 相对路径
+                    if current == '~':
+                        # 如果当前是~，无法准确拼接，除非知道HOME。暂且保留~
+                        # 或者假设 ~ 就是 /root 或 /home/user，这里为了安全起见，
+                        # 如果是相对路径且当前是~，我们可能需要先获取一次pwd。
+                        # 这里简化处理，直接拼接，虽然可能不准确
+                        self.cwd_cache[session_id] = f"{current}/{path}"
+                    elif current == '/':
+                         self.cwd_cache[session_id] = f"/{path}"
+                    else:
+                        self.cwd_cache[session_id] = f"{current}/{path}"
+
+    def get_cwd(self, session_id: str) -> str:
+        with self.lock:
+            return self.cwd_cache.get(session_id, '~')
+
     def add_command_to_history(self, session_id: str, command: str):
         """添加命令到历史记录"""
         with self.lock:
@@ -292,10 +339,128 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     channel.send(command + "\n")
                     # 将命令添加到历史记录
                     app.state.ssh_manager.add_command_to_history(session_id, command)
+                    # 尝试更新CWD
+                    app.state.ssh_manager.update_cwd(session_id, command)
                     
                 elif message["type"] == "tab_complete":
-                    # 处理TAB补全请求，发送制表符到SSH通道
-                    channel.send("\t")
+                    # 处理TAB补全请求
+                    # 如果前端发送了当前上下文，我们尝试智能补全
+                    context_command = ""
+                    if "data" in message and isinstance(message["data"], dict) and "command" in message["data"]:
+                        context_command = message["data"]["command"]
+                    
+                    if context_command:
+                        try:
+                            # 获取当前猜测的CWD
+                            cwd = app.state.ssh_manager.get_cwd(session_id)
+                            
+                            # 分析最后一个词
+                            # 注意：这里需要处理引号等复杂情况，但简单起见，我们只处理空格分割
+                            args = context_command.split()
+                            # 如果是以空格结尾，说明是在输入新的参数，last_word为空
+                            if context_command.endswith(" "):
+                                last_word = ""
+                            else:
+                                last_word = args[-1] if args else ""
+                            
+                            # 决定补全类型
+                            # 如果是第一个词，或者前面是管道/分号等，尝试命令补全
+                            # 简单判断：如果是第一个词，补全命令
+                            is_command_completion = len(args) <= 1 and not context_command.endswith(" ")
+                            
+                            # 构建补全命令
+                            completion_script = ""
+                            use_fallback = False
+                            
+                            if is_command_completion:
+                                # 命令补全
+                                completion_script = f"compgen -c {last_word}"
+                            else:
+                                # 文件/目录补全
+                                # 特殊处理 cd 命令，只补全目录
+                                if args[0] == 'cd':
+                                    completion_script = f"compgen -d {last_word}"
+                                else:
+                                    completion_script = f"compgen -f {last_word}"
+                                
+                                # 在正确的目录下执行
+                                if cwd != '~':
+                                    completion_script = f"cd {cwd} && {completion_script}"
+                            
+                            # 使用exec_command执行（不影响主通道）
+                            print(f"执行补全脚本: {completion_script}")
+                            stdin, stdout, stderr = ssh_client.exec_command(f"bash -c '{completion_script}'", timeout=5)
+                            
+                            # 读取输出
+                            out_data = stdout.read().decode('utf-8', errors='ignore')
+                            err_data = stderr.read().decode('utf-8', errors='ignore')
+                            
+                            completions = [c.strip() for c in out_data.split('\n') if c.strip()]
+                            
+                            # 如果 compgen 失败或无结果，且不是命令补全，尝试 ls 回退
+                            if not completions and not is_command_completion:
+                                print(f"compgen无结果，尝试ls回退。Error: {err_data}")
+                                search_pattern = f"{last_word}*"
+                                if args[0] == 'cd':
+                                    # 只查找目录，使用 ls -d */ 模式，但 ls -d pattern*/ 比较麻烦
+                                    # 使用 find . -maxdepth 1 -type d -name "pattern*" 也是一种选择，但 find 语法复杂
+                                    # 简单起见，使用 ls -d，然后过滤
+                                    ls_cmd = f"ls -1d {search_pattern}"
+                                else:
+                                    ls_cmd = f"ls -1d {search_pattern}"
+                                
+                                if cwd != '~':
+                                    ls_cmd = f"cd {cwd} && {ls_cmd}"
+                                    
+                                print(f"执行回退脚本: {ls_cmd}")
+                                stdin, stdout, stderr = ssh_client.exec_command(f"bash -c '{ls_cmd}'", timeout=5)
+                                out_data = stdout.read().decode('utf-8', errors='ignore')
+                                # ls -d 输出可能包含 ./ 前缀，或者就是文件名
+                                # 对于 ls -d，如果找不到匹配项，会报错
+                                ls_results = [c.strip() for c in out_data.split('\n') if c.strip()]
+                                
+                                # 如果是 cd 命令，只保留目录（ls -d 并不保证只返回目录，它只是不列出目录内容）
+                                # 这里无法准确判断是否为目录，除非用 ls -F
+                                if ls_results and args[0] == 'cd':
+                                    # 再次尝试验证是否为目录，或者简单地信任（用户体验可能稍差）
+                                    # 为了更好的体验，使用 ls -F
+                                    ls_cmd_f = f"ls -1Fd {search_pattern}"
+                                    if cwd != '~':
+                                        ls_cmd_f = f"cd {cwd} && {ls_cmd_f}"
+                                    stdin, stdout, stderr = ssh_client.exec_command(f"bash -c '{ls_cmd_f}'", timeout=5)
+                                    out_data = stdout.read().decode('utf-8', errors='ignore')
+                                    # 筛选以 / 结尾的项
+                                    completions = [c.strip().rstrip('/') for c in out_data.split('\n') if c.strip() and c.strip().endswith('/')]
+                                else:
+                                    completions = ls_results
+
+                            print(f"补全结果: {len(completions)} 个候选项")
+                            
+                            # 发送补全选项给前端
+                            await websocket.send_text(json.dumps({
+                                "type": "tab_completion_options",
+                                "data": {
+                                    "options": completions,
+                                    "base": last_word,
+                                    "path_prefix": cwd if not is_command_completion else "",
+                                    "debug_error": err_data if not completions else ""
+                                }
+                            }))
+                            
+                        except Exception as e:
+                            print(f"智能补全失败: {e}")
+                            # 发送空结果，告知前端处理完毕
+                            await websocket.send_text(json.dumps({
+                                "type": "tab_completion_options",
+                                "data": {
+                                    "options": [],
+                                    "base": "",
+                                    "error": str(e)
+                                }
+                            }))
+                    else:
+                        # 无上下文，回退到发送制表符
+                        channel.send("\t")
                     
                 elif message["type"] == "tab_complete_result":
                     # 处理TAB补全结果
