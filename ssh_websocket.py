@@ -249,11 +249,17 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         if data:
                             # 过滤服务器回显的命令，避免重复显示
                             nonlocal last_sent_command
-                            if last_sent_command and last_sent_command + '\r\n' in data:
-                                # 替换掉回显的命令
-                                data = data.replace(last_sent_command + '\r\n', '')
-                                # 重置last_sent_command，避免多次过滤
-                                last_sent_command = None
+                            if last_sent_command:
+                                # 处理命令回显，考虑ANSI转义序列
+                                # 先处理可能包含控制字符的情况
+                                import re
+                                # 创建一个正则表达式，匹配命令回显，忽略中间的控制序列
+                                cmd_pattern = re.escape(last_sent_command) + r'(?:\x1b\[[0-9;]*[a-zA-Z])*\r\n'
+                                if re.search(cmd_pattern, data):
+                                    # 替换掉回显的命令和控制序列
+                                    data = re.sub(cmd_pattern, '', data)
+                                    # 重置last_sent_command，避免多次过滤
+                                    last_sent_command = None
                             
                             # 发送过滤后的输出
                             await websocket.send_text(json.dumps({
