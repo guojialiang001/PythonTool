@@ -370,71 +370,51 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             # 简单判断：如果是第一个词，补全命令
                             is_command_completion = len(args) <= 1 and not context_command.endswith(" ")
                             
-                            # 构建补全命令
-                            completion_script = ""
-                            use_fallback = False
+                            completions = []
+                            err_data = ""
                             
                             if is_command_completion:
-                                # 命令补全
+                                # 命令补全，使用 compgen -c
                                 completion_script = f"compgen -c {last_word}"
+                                stdin, stdout, stderr = ssh_client.exec_command(f"bash -c '{completion_script}'", timeout=5)
+                                out_data = stdout.read().decode('utf-8', errors='ignore')
+                                completions = [c.strip() for c in out_data.split('\n') if c.strip()]
                             else:
                                 # 文件/目录补全
-                                # 特殊处理 cd 命令，只补全目录
-                                if args[0] == 'cd':
-                                    completion_script = f"compgen -d {last_word}"
-                                else:
-                                    completion_script = f"compgen -f {last_word}"
-                                
-                                # 在正确的目录下执行
-                                if cwd != '~':
-                                    completion_script = f"cd {cwd} && {completion_script}"
-                            
-                            # 使用exec_command执行（不影响主通道）
-                            print(f"执行补全脚本: {completion_script}")
-                            stdin, stdout, stderr = ssh_client.exec_command(f"bash -c '{completion_script}'", timeout=5)
-                            
-                            # 读取输出
-                            out_data = stdout.read().decode('utf-8', errors='ignore')
-                            err_data = stderr.read().decode('utf-8', errors='ignore')
-                            
-                            completions = [c.strip() for c in out_data.split('\n') if c.strip()]
-                            
-                            # 如果 compgen 失败或无结果，且不是命令补全，尝试 ls 回退
-                            if not completions and not is_command_completion:
-                                print(f"compgen无结果，尝试ls回退。Error: {err_data}")
-                                search_pattern = f"{last_word}*"
-                                if args[0] == 'cd':
-                                    # 只查找目录，使用 ls -d */ 模式，但 ls -d pattern*/ 比较麻烦
-                                    # 使用 find . -maxdepth 1 -type d -name "pattern*" 也是一种选择，但 find 语法复杂
-                                    # 简单起见，使用 ls -d，然后过滤
-                                    ls_cmd = f"ls -1d {search_pattern}"
-                                else:
-                                    ls_cmd = f"ls -1d {search_pattern}"
-                                
+                                # 采用更可靠的策略：列出当前目录所有文件，在Python端过滤
+                                # 使用 ls -1F，目录会以 / 结尾，可执行文件以 * 结尾等
+                                ls_cmd = "ls -1F"
                                 if cwd != '~':
                                     ls_cmd = f"cd {cwd} && {ls_cmd}"
-                                    
-                                print(f"执行回退脚本: {ls_cmd}")
-                                stdin, stdout, stderr = ssh_client.exec_command(f"bash -c '{ls_cmd}'", timeout=5)
-                                out_data = stdout.read().decode('utf-8', errors='ignore')
-                                # ls -d 输出可能包含 ./ 前缀，或者就是文件名
-                                # 对于 ls -d，如果找不到匹配项，会报错
-                                ls_results = [c.strip() for c in out_data.split('\n') if c.strip()]
                                 
-                                # 如果是 cd 命令，只保留目录（ls -d 并不保证只返回目录，它只是不列出目录内容）
-                                # 这里无法准确判断是否为目录，除非用 ls -F
-                                if ls_results and args[0] == 'cd':
-                                    # 再次尝试验证是否为目录，或者简单地信任（用户体验可能稍差）
-                                    # 为了更好的体验，使用 ls -F
-                                    ls_cmd_f = f"ls -1Fd {search_pattern}"
-                                    if cwd != '~':
-                                        ls_cmd_f = f"cd {cwd} && {ls_cmd_f}"
-                                    stdin, stdout, stderr = ssh_client.exec_command(f"bash -c '{ls_cmd_f}'", timeout=5)
-                                    out_data = stdout.read().decode('utf-8', errors='ignore')
-                                    # 筛选以 / 结尾的项
-                                    completions = [c.strip().rstrip('/') for c in out_data.split('\n') if c.strip() and c.strip().endswith('/')]
+                                print(f"执行补全列表获取: {ls_cmd}")
+                                # 直接执行，不使用 bash -c 包装，减少转义问题
+                                stdin, stdout, stderr = ssh_client.exec_command(ls_cmd, timeout=5)
+                                
+                                out_data = stdout.read().decode('utf-8', errors='ignore')
+                                err_data = stderr.read().decode('utf-8', errors='ignore')
+                                
+                                all_files = [c.strip() for c in out_data.split('\n') if c.strip()]
+                                
+                                # 在 Python 端进行过滤
+                                if args[0] == 'cd':
+                                    # cd 命令只补全目录（以 / 结尾的项）
+                                    # 过滤出以 last_word 开头 且 以 / 结尾的项
+                                    filtered = [f for f in all_files if f.startswith(last_word) and f.endswith('/')]
+                                    # 去掉末尾的 /，因为前端补全通常不需要显示 /
+                                    completions = [f[:-1] for f in filtered]
                                 else:
-                                    completions = ls_results
+                                    # 其他命令补全所有文件
+                                    # 过滤出以 last_word 开头的项
+                                    # 此时保留 ls -F 的标记（如 / * @ 等），还是去掉？
+                                    # 为了保持一致性，我们去掉末尾的标记字符
+                                    filtered = [f for f in all_files if f.startswith(last_word)]
+                                    completions = []
+                                    for f in filtered:
+                                        if f.endswith(('/', '*', '@', '|', '=')):
+                                            completions.append(f[:-1])
+                                        else:
+                                            completions.append(f)
 
                             print(f"补全结果: {len(completions)} 个候选项")
                             
