@@ -84,6 +84,128 @@ class SSHSessionManager:
         with self.lock:
             return self.cwd_cache.get(session_id, '~')
 
+    def get_ls_file_info(self, ssh_client, filename: str, current_dir: str) -> dict:
+        """获取文件详细信息（用于ls结构化输出）"""
+        try:
+            # 使用stat命令获取文件详细信息
+            stat_cmd = f"stat -c '%F|%a|%A' '{filename}'"
+            stdin, stdout, stderr = ssh_client.exec_command(f"cd {current_dir} && {stat_cmd}", timeout=5)
+            stat_output = stdout.read().decode('utf-8', errors='ignore').strip()
+            
+            if not stat_output:
+                # 如果stat命令失败，使用ls -ld作为备选
+                ls_cmd = f"ls -ld '{filename}'"
+                stdin, stdout, stderr = ssh_client.exec_command(f"cd {current_dir} && {ls_cmd}", timeout=5)
+                ls_output = stdout.read().decode('utf-8', errors='ignore').strip()
+                
+                if ls_output:
+                    # 解析ls -ld输出
+                    parts = ls_output.split()
+                    if len(parts) >= 9:
+                        permissions = parts[0]
+                        file_type = "directory" if permissions.startswith('d') else "file"
+                        is_executable = permissions[3] == 'x' or permissions[6] == 'x' or permissions[9] == 'x'
+                        is_base = filename.lower() in ['base', 'miniconda', 'conda', 'anaconda']
+                        
+                        return {
+                            "name": filename,
+                            "type": file_type,
+                            "permissions": permissions[1:],  # 移除第一个字符（文件类型标识）
+                            "is_executable": is_executable,
+                            "is_base": is_base
+                        }
+                
+                # 如果都失败，返回默认值
+                return {
+                    "name": filename,
+                    "type": "file",
+                    "permissions": "----------",
+                    "is_executable": False,
+                    "is_base": False
+                }
+            
+            # 解析stat输出: 文件类型|八进制权限|符号权限
+            file_type_str, octal_perms, symbolic_perms = stat_output.split('|')
+            
+            # 判断文件类型
+            file_type = "file"
+            if "directory" in file_type_str.lower():
+                file_type = "directory"
+            elif "symbolic link" in file_type_str.lower():
+                file_type = "symlink"
+            elif "socket" in file_type_str.lower():
+                file_type = "socket"
+            elif "fifo" in file_type_str.lower():
+                file_type = "pipe"
+            elif "block device" in file_type_str.lower():
+                file_type = "block"
+            elif "character device" in file_type_str.lower():
+                file_type = "char"
+            
+            # 判断是否可执行（基于符号权限）
+            is_executable = 'x' in symbolic_perms
+            
+            # 判断是否是BASE路径
+            is_base = filename.lower() in ['base', 'miniconda', 'conda', 'anaconda']
+            
+            return {
+                "name": filename,
+                "type": file_type,
+                "permissions": symbolic_perms,
+                "is_executable": is_executable,
+                "is_base": is_base
+            }
+            
+        except Exception as e:
+            print(f"获取文件信息失败 {filename}: {e}")
+            return {
+                "name": filename,
+                "type": "file",
+                "permissions": "----------",
+                "is_executable": False,
+                "is_base": False
+            }
+
+    def process_ls_structured(self, ssh_client, command: str, session_id: str, current_dir: str) -> dict:
+        """处理ls命令，返回结构化数据"""
+        try:
+            # 提取ls命令的参数和路径
+            import re
+            ls_match = re.match(r'^\s*ls\s*(.*)$', command)
+            ls_args = ls_match.group(1) if ls_match else ""
+            
+            # 执行ls -1获取文件列表
+            ls_cmd = f"ls -1 {ls_args}".strip()
+            stdin, stdout, stderr = ssh_client.exec_command(f"cd {current_dir} && {ls_cmd}", timeout=5)
+            ls_output = stdout.read().decode('utf-8', errors='ignore').strip()
+            
+            if not ls_output:
+                return None
+            
+            # 解析文件列表
+            files = [f.strip() for f in ls_output.split('\n') if f.strip()]
+            
+            # 获取每个文件的详细信息
+            file_info_list = []
+            for filename in files:
+                file_info = self.get_ls_file_info(ssh_client, filename, current_dir)
+                file_info_list.append(file_info)
+            
+            # 获取当前提示符（模拟）
+            prompt = f"(base) root@VM-0-15-ubuntu:{current_dir}# "
+            
+            return {
+                "type": "ls_output",
+                "data": {
+                    "files": file_info_list,
+                    "prompt": prompt
+                }
+            }
+            
+        except Exception as e:
+            print(f"处理ls结构化输出失败: {e}")
+            return None
+
     def add_command_to_history(self, session_id: str, command: str):
         """添加命令到历史记录"""
         with self.lock:
@@ -294,74 +416,90 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         # 启动数据接收任务
         output_paused = asyncio.Event()
         output_paused.set() # Initially, output is not paused
+        output_buffer = ""  # 输出缓冲区
+        last_output_time = 0  # 最后输出时间
+        OUTPUT_MERGE_TIMEOUT = 0.05  # 输出合并超时时间（秒）
 
         async def receive_ssh_output():
+            nonlocal output_buffer, last_output_time
             while True:
                 try:
+                    # 接收数据到缓冲区
                     if channel.recv_ready() and output_paused.is_set():
                         data = channel.recv(1024).decode('utf-8', errors='ignore')
                         if data:
-                            # 过滤服务器回显的命令，避免重复显示
-                            nonlocal last_sent_command
-                            if last_sent_command:
-                                # 处理命令回显，考虑ANSI转义序列
-                                # 先处理可能包含控制字符的情况
-                                import re
-                                # 创建一个正则表达式，匹配命令回显，忽略中间的控制序列
-                                cmd_pattern = re.escape(last_sent_command) + r'(?:\x1b\[[0-9;]*[a-zA-Z])*\r\n'
-                                if re.search(cmd_pattern, data):
-                                    # 替换掉回显的命令和控制序列
-                                    data = re.sub(cmd_pattern, '', data)
-                                    # 重置last_sent_command，避免多次过滤
-                                    last_sent_command = None
+                            # 将数据添加到缓冲区
+                            output_buffer += data
+                            last_output_time = time.time()
+                            
+                    # 检查是否需要发送缓冲区内容
+                    current_time = time.time()
+                    if output_buffer and (current_time - last_output_time > OUTPUT_MERGE_TIMEOUT):
+                        # 处理缓冲区中的数据
+                        data = output_buffer
+                        output_buffer = ""  # 清空缓冲区
+                        
+                        # 过滤服务器回显的命令，避免重复显示
+                        nonlocal last_sent_command
+                        if last_sent_command:
+                            # 处理命令回显，考虑ANSI转义序列
+                            # 先处理可能包含控制字符的情况
+                            import re
+                            # 创建一个正则表达式，匹配命令回显，忽略中间的控制序列
+                            cmd_pattern = re.escape(last_sent_command) + r'(?:\x1b\[[0-9;]*[a-zA-Z])*\r\n'
+                            if re.search(cmd_pattern, data):
+                                # 替换掉回显的命令和控制序列
+                                data = re.sub(cmd_pattern, '', data)
+                                # 重置last_sent_command，避免多次过滤
+                                last_sent_command = None
 
-                            # 过滤不必要的系统状态行（如 Memory usage / IPv4 address 提示）
-                            try:
-                                import re as _re
-                                ansi = _re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-                                stripped = ansi.sub('', data)
-                                # 逐行过滤
-                                lines = data.replace('\r\n', '\n').split('\n')
-                                stripped_lines = stripped.replace('\r\n', '\n').split('\n')
-                                filtered = []
-                                drop_prefixes = [
-                                    'Memory usage:',
-                                    'IPv4 address for ',
-                                    'System load:'
-                                ]
-                                for orig, s in zip(lines, stripped_lines):
-                                    s = s.strip()
-                                    if not s:
-                                        filtered.append(orig)
-                                        continue
-                                    if any(s.startswith(dp) for dp in drop_prefixes):
-                                        # 丢弃该行
-                                        continue
+                        # 过滤不必要的系统状态行（如 Memory usage / IPv4 address 提示）
+                        try:
+                            import re as _re
+                            ansi = _re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+                            stripped = ansi.sub('', data)
+                            # 逐行过滤
+                            lines = data.replace('\r\n', '\n').split('\n')
+                            stripped_lines = stripped.replace('\r\n', '\n').split('\n')
+                            filtered = []
+                            drop_prefixes = [
+                                'Memory usage:',
+                                'IPv4 address for ',
+                                'System load:'
+                            ]
+                            for orig, s in zip(lines, stripped_lines):
+                                s = s.strip()
+                                if not s:
                                     filtered.append(orig)
-                                data = '\n'.join(filtered)
-                            except Exception:
-                                # 过滤异常时忽略，继续输出
-                                pass
+                                    continue
+                                if any(s.startswith(dp) for dp in drop_prefixes):
+                                    # 丢弃该行
+                                    continue
+                                filtered.append(orig)
+                            data = '\n'.join(filtered)
+                        except Exception:
+                            # 过滤异常时忽略，继续输出
+                            pass
 
-                            # 发送过滤后的输出
-                            try:
-                                import re as _clean_re
-                                data_for_send = data
-                                # 移除常见ANSI CSI颜色/样式控制序列
-                                data_for_send = _clean_re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
-                                # 移除Bracketed Paste模式切换序列
-                                data_for_send = _clean_re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
-                                # 移除OSC (Operating System Command) 序列，如设置终端标题
-                                data_for_send = _clean_re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", data_for_send)
-                                # 统一换行符
-                                data_for_send = data_for_send.replace("\r\n", "\n").replace("\r", "\n")
-                            except Exception:
-                                data_for_send = data
+                        # 发送过滤后的输出
+                        try:
+                            import re as _clean_re
+                            data_for_send = data
+                            # 移除常见ANSI CSI颜色/样式控制序列
+                            data_for_send = _clean_re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
+                            # 移除Bracketed Paste模式切换序列
+                            data_for_send = _clean_re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
+                            # 移除OSC (Operating System Command) 序列，如设置终端标题
+                            data_for_send = _clean_re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", data_for_send)
+                            # 统一换行符
+                            data_for_send = data_for_send.replace("\r\n", "\n").replace("\r", "\n")
+                        except Exception:
+                            data_for_send = data
 
-                            await websocket.send_text(json.dumps({
-                                "type": "output",
-                                "data": data_for_send
-                            }))
+                        await websocket.send_text(json.dumps({
+                            "type": "output",
+                            "data": data_for_send
+                        }))
                     await asyncio.sleep(0.01)
                 except:
                     break
@@ -384,8 +522,39 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     command = message["data"]["command"]
                     # 移除命令末尾的换行符，避免发送多余的换行导致重复提示符
                     command = command.rstrip('\r\n')
-                    # 为了稳定排版，自动将纯 ls 输出改为单列且无颜色
-                    # 仅在命令为简单的 ls（不含管道/分号/逻辑运算）且未显式指定 -l/-1 时应用
+                    
+                    # 检查是否为ls命令，尝试结构化输出
+                    try:
+                        import re as _lsre
+                        simple_ls = _lsre.match(r"^\s*ls(\s|$)", command) is not None
+                        has_ops = any(op in command for op in ['|', ';', '&&', '||'])
+                        
+                        if simple_ls and not has_ops:
+                            # 获取当前工作目录
+                            current_dir = app.state.ssh_manager.get_cwd(session_id)
+                            
+                            # 尝试结构化输出（颜色支持）
+                            ls_structured = app.state.ssh_manager.process_ls_structured(
+                                ssh_client, command, session_id, current_dir
+                            )
+                            
+                            if ls_structured and ls_structured["data"]["files"]:
+                                # 发送结构化输出
+                                await websocket.send_text(json.dumps(ls_structured))
+                                
+                                # 发送提示符（模拟命令执行完成）
+                                prompt_response = {
+                                    "type": "output",
+                                    "data": ls_structured["data"]["prompt"]
+                                }
+                                await websocket.send_text(json.dumps(prompt_response))
+                                
+                                # 跳过正常命令执行流程
+                                continue
+                    except Exception as e:
+                        print(f"结构化ls输出失败，回退到普通模式: {e}")
+                    
+                    # 回退到普通ls处理（单列无颜色）
                     try:
                         import re as _lsre
                         simple_ls = _lsre.match(r"^\s*ls(\s|$)", command) is not None
