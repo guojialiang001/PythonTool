@@ -285,6 +285,9 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                 if message["type"] == "command":
                     # 执行命令
                     command = message["data"]["command"]
+                    # 移除命令末尾的换行符，避免发送多余的换行导致重复提示符
+                    command = command.rstrip('\r\n')
+                    
                     last_sent_command = command
                     channel.send(command + "\n")
                     # 将命令添加到历史记录
