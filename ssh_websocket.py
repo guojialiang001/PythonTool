@@ -219,11 +219,6 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         # 创建交互式shell通道，配置终端类型和模式
         channel = ssh_client.invoke_shell(term='xterm', width=80, height=24)
         channel.settimeout(1.0)  # 增加通道超时时间，提高稳定性
-        # 禁用回显，避免命令重复显示
-        channel.setblocking(1)
-        channel.send(b"stty -echo\r")
-        # 恢复非阻塞模式
-        channel.setblocking(0)
         print(f"创建shell通道成功")
         
         # 发送连接成功消息
