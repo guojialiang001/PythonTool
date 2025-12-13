@@ -344,9 +344,23 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 pass
 
                             # 发送过滤后的输出
+                            try:
+                                import re as _clean_re
+                                data_for_send = data
+                                # 移除常见ANSI CSI颜色/样式控制序列
+                                data_for_send = _clean_re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
+                                # 移除Bracketed Paste模式切换序列
+                                data_for_send = _clean_re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
+                                # 移除OSC (Operating System Command) 序列，如设置终端标题
+                                data_for_send = _clean_re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", data_for_send)
+                                # 统一换行符
+                                data_for_send = data_for_send.replace("\r\n", "\n").replace("\r", "\n")
+                            except Exception:
+                                data_for_send = data
+
                             await websocket.send_text(json.dumps({
                                 "type": "output",
-                                "data": data
+                                "data": data_for_send
                             }))
                     await asyncio.sleep(0.01)
                 except:
@@ -370,6 +384,22 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     command = message["data"]["command"]
                     # 移除命令末尾的换行符，避免发送多余的换行导致重复提示符
                     command = command.rstrip('\r\n')
+                    # 为了稳定排版，自动将纯 ls 输出改为单列且无颜色
+                    # 仅在命令为简单的 ls（不含管道/分号/逻辑运算）且未显式指定 -l/-1 时应用
+                    try:
+                        import re as _lsre
+                        simple_ls = _lsre.match(r"^\s*ls(\s|$)", command) is not None
+                        has_ops = any(op in command for op in ['|', ';', '&&', '||'])
+                        if simple_ls and not has_ops:
+                            tail = command[len(command.split('ls', 1)[0]) + 2:] if 'ls' in command else ''
+                            # 如果已有 -l 或 -1 或 --format=single-column，则不改写
+                            has_long = _lsre.search(r"(^|\s)-[^\s]*l", tail) is not None
+                            has_single = ('-1' in tail) or ('--format=single-column' in tail)
+                            if not has_long and not has_single:
+                                # 将前缀 ls 改为 ls -1 --color=never，保留原尾部参数和路径
+                                command = _lsre.sub(r"^\s*ls", "ls -1 --color=never", command, count=1)
+                    except Exception:
+                        pass
                     
                     last_sent_command = command
                     channel.send(command + "\n")
