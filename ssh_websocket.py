@@ -377,6 +377,15 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     app.state.ssh_manager.add_command_to_history(session_id, command)
                     # 尝试更新CWD
                     app.state.ssh_manager.update_cwd(session_id, command)
+                elif message["type"] == "resize":
+                    # 处理终端尺寸调整
+                    if "data" in message and isinstance(message["data"], dict):
+                        width = message["data"].get("width")
+                        height = message["data"].get("height")
+                        if width and height and channel:
+                            channel.resize_pty(width=width, height=height)
+                            print(f"终端尺寸调整为: width={width}, height={height}")
+
                     
                 elif message["type"] == "tab_complete":
                     # 处理TAB补全请求
