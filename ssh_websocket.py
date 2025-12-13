@@ -247,6 +247,15 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     if channel.recv_ready():
                         data = channel.recv(1024).decode('utf-8', errors='ignore')
                         if data:
+                            # 过滤服务器回显的命令，避免重复显示
+                            nonlocal last_sent_command
+                            if last_sent_command and last_sent_command + '\r\n' in data:
+                                # 替换掉回显的命令
+                                data = data.replace(last_sent_command + '\r\n', '')
+                                # 重置last_sent_command，避免多次过滤
+                                last_sent_command = None
+                            
+                            # 发送过滤后的输出
                             await websocket.send_text(json.dumps({
                                 "type": "output",
                                 "data": data
@@ -258,6 +267,9 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         # 启动接收任务
         receive_task = asyncio.create_task(receive_ssh_output())
         
+        # 命令跟踪，用于过滤服务器回显
+        last_sent_command = None
+        
         # 处理客户端消息
         while True:
             try:
@@ -267,6 +279,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                 if message["type"] == "command":
                     # 执行命令
                     command = message["data"]["command"]
+                    last_sent_command = command
                     channel.send(command + "\n")
                     # 将命令添加到历史记录
                     app.state.ssh_manager.add_command_to_history(session_id, command)
