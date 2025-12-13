@@ -51,7 +51,27 @@ class SSHSessionManager:
                 # 忽略复杂的情况，如变量等
                 if '$' in path or '`' in path:
                     return
-                    
+                
+                # 修复：增强版 - 总是尝试获取真实的当前目录
+                if ssh_client:
+                    try:
+                        # 执行cd命令后立即获取真实的当前目录
+                        # 使用组合命令：先cd，再pwd
+                        combined_command = f"cd '{path}' && pwd"
+                        stdin, stdout, stderr = ssh_client.exec_command(combined_command, timeout=5)
+                        real_cwd = stdout.read().decode('utf-8', errors='ignore').strip()
+                        error_output = stderr.read().decode('utf-8', errors='ignore').strip()
+                        
+                        if real_cwd and not error_output:
+                            self.cwd_cache[session_id] = real_cwd
+                            print(f"CWD真实更新: {real_cwd}")
+                            return
+                        elif error_output:
+                            print(f"cd命令执行错误: {error_output}")
+                    except Exception as e:
+                        print(f"获取真实CWD失败: {e}")
+                
+                # 如果无法获取真实路径，使用本地逻辑推算
                 current = self.cwd_cache.get(session_id, '~')
                 
                 if path.startswith('/'):
@@ -60,20 +80,10 @@ class SSHSessionManager:
                 elif path == '~':
                     self.cwd_cache[session_id] = '~'
                 elif path == '..':
-                    # 修复：正确处理上一级目录 - 增强版
+                    # 本地逻辑处理上一级目录
                     if current == '~':
-                        # 从主目录返回，需要获取实际的主目录路径
-                        # 通过SSH执行pwd命令获取真实路径
-                        try:
-                            stdin, stdout, stderr = ssh_client.exec_command("pwd", timeout=5)
-                            real_home = stdout.read().decode('utf-8', errors='ignore').strip()
-                            if real_home:
-                                parent = os.path.dirname(real_home)
-                                self.cwd_cache[session_id] = parent or '/'
-                            else:
-                                self.cwd_cache[session_id] = '/home'  # 回退方案
-                        except:
-                            self.cwd_cache[session_id] = '/home'  # 回退方案
+                        # 从主目录返回，使用回退方案
+                        self.cwd_cache[session_id] = '/home'
                     elif current == '/':
                         # 已经在根目录，保持不变
                         pass
@@ -86,9 +96,6 @@ class SSHSessionManager:
                 else:
                     # 相对路径
                     if current == '~':
-                        # 如果当前是~，无法准确拼接，除非知道HOME。暂且保留~
-                        # 改进：如果当前是~，我们应该认为它是相对于用户的HOME目录
-                        # 为了补全能工作，我们保持路径为 ~/path
                         self.cwd_cache[session_id] = f"~/{path}"
                     elif current == '/':
                          self.cwd_cache[session_id] = f"/{path}"
@@ -106,6 +113,28 @@ class SSHSessionManager:
         """获取当前用户名（简化版本）"""
         # 这里应该通过SSH连接获取实际用户名，暂时返回默认值
         return "root"
+
+    def sync_current_directory(self, session_id: str, ssh_client: paramiko.SSHClient) -> str:
+        """同步当前工作目录（从SSH获取真实路径）"""
+        if not ssh_client:
+            return self.cwd_cache.get(session_id, '~')
+        
+        try:
+            stdin, stdout, stderr = ssh_client.exec_command("pwd", timeout=3)
+            real_cwd = stdout.read().decode('utf-8', errors='ignore').strip()
+            error_output = stderr.read().decode('utf-8', errors='ignore').strip()
+            
+            if real_cwd and not error_output:
+                with self.lock:
+                    self.cwd_cache[session_id] = real_cwd
+                print(f"CWD同步: {real_cwd}")
+                return real_cwd
+            else:
+                print(f"CWD同步失败: {error_output}")
+                return self.cwd_cache.get(session_id, '~')
+        except Exception as e:
+            print(f"CWD同步异常: {e}")
+            return self.cwd_cache.get(session_id, '~')
 
     def get_file_color_info(self, filename: str, file_type: str, is_executable: bool, is_base: bool) -> dict:
         """获取文件颜色信息（增强版）"""
@@ -749,6 +778,16 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     app.state.ssh_manager.add_command_to_history(session_id, command)
                     # 尝试更新CWD（传入ssh_client用于cd ..命令）
                     app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
+                    
+                    # 修复：对于cd命令，延迟同步当前目录
+                    if command.strip().startswith('cd '):
+                        async def delayed_sync():
+                            await asyncio.sleep(0.5)  # 等待cd命令执行完成
+                            try:
+                                app.state.ssh_manager.sync_current_directory(session_id, ssh_client)
+                            except Exception as e:
+                                print(f"延迟CWD同步失败: {e}")
+                        asyncio.create_task(delayed_sync())
                 elif message["type"] == "resize":
                     # 处理终端尺寸调整
                     if "data" in message and isinstance(message["data"], dict):
