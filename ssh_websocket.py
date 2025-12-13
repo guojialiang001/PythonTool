@@ -60,9 +60,18 @@ class SSHSessionManager:
                 elif path == '~':
                     self.cwd_cache[session_id] = '~'
                 elif path == '..':
-                    # 简单处理上一级目录，实际上很复杂，这里只做字符串处理
-                    if current != '~' and current != '/':
-                        self.cwd_cache[session_id] = '/'.join(current.rstrip('/').split('/')[:-1]) or '/'
+                    # 修复：正确处理上一级目录
+                    if current == '~':
+                        # 从主目录返回，需要获取实际的主目录路径
+                        # 这里我们假设主目录为 /home/username，实际应该查询
+                        self.cwd_cache[session_id] = '/home'  # 简化处理
+                    elif current == '/':
+                        # 已经在根目录，保持不变
+                        pass
+                    else:
+                        # 普通路径，返回上一级
+                        parent = os.path.dirname(current.rstrip('/'))
+                        self.cwd_cache[session_id] = parent or '/'
                 elif path == '.':
                     pass
                 else:
@@ -84,8 +93,108 @@ class SSHSessionManager:
         with self.lock:
             return self.cwd_cache.get(session_id, '~')
 
+    def get_username(self, session_id: str) -> str:
+        """获取当前用户名（简化版本）"""
+        # 这里应该通过SSH连接获取实际用户名，暂时返回默认值
+        return "root"
+
+    def get_file_color_info(self, filename: str, file_type: str, is_executable: bool, is_base: bool) -> dict:
+        """获取文件颜色信息（增强版）"""
+        # 基础颜色映射
+        color_info = {
+            "color_class": "file",
+            "ansi_color": "\x1b[0m",
+            "css_color": "#ffffff"
+        }
+        
+        # 隐藏文件检测
+        if filename.startswith('.'):
+            color_info.update({
+                "color_class": "hidden",
+                "ansi_color": "\x1b[90m",
+                "css_color": "#808080"
+            })
+            return color_info
+        
+        # 扩展名检测
+        ext = filename.split('.')[-1].lower() if '.' in filename else ""
+        
+        # 压缩文件
+        compressed_exts = ['zip', 'tar', 'gz', 'bz2', 'xz', '7z', 'rar', 'tgz', 'tbz']
+        if ext in compressed_exts:
+            color_info.update({
+                "color_class": "compressed",
+                "ansi_color": "\x1b[91m",
+                "css_color": "#ff6b6b"
+            })
+            return color_info
+        
+        # 图片文件
+        image_exts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'ico', 'webp', 'tiff']
+        if ext in image_exts:
+            color_info.update({
+                "color_class": "image",
+                "ansi_color": "\x1b[95m",
+                "css_color": "#cc99ff"
+            })
+            return color_info
+        
+        # 代码文件
+        code_exts = ['py', 'js', 'java', 'cpp', 'c', 'h', 'php', 'rb', 'go', 'rs', 'ts', 'jsx', 'tsx', 'vue']
+        if ext in code_exts:
+            color_info.update({
+                "color_class": "code",
+                "ansi_color": "\x1b[92m",
+                "css_color": "#51cf66"
+            })
+            return color_info
+        
+        # 文档文件
+        doc_exts = ['pdf', 'doc', 'docx', 'txt', 'md', 'rst', 'odt']
+        if ext in doc_exts:
+            color_info.update({
+                "color_class": "document",
+                "ansi_color": "\x1b[96m",
+                "css_color": "#74c0fc"
+            })
+            return color_info
+        
+        # 基础文件类型
+        if file_type == "directory":
+            color_info.update({
+                "color_class": "directory",
+                "ansi_color": "\x1b[34;1m",
+                "css_color": "#339af0"
+            })
+        elif is_base:
+            color_info.update({
+                "color_class": "base",
+                "ansi_color": "\x1b[33;1m",
+                "css_color": "#ffd43b"
+            })
+        elif is_executable:
+            color_info.update({
+                "color_class": "executable",
+                "ansi_color": "\x1b[92m",
+                "css_color": "#51cf66"
+            })
+        elif file_type == "symlink":
+            color_info.update({
+                "color_class": "symlink",
+                "ansi_color": "\x1b[96m",
+                "css_color": "#22d3ee"
+            })
+        elif file_type in ["socket", "pipe", "block", "char"]:
+            color_info.update({
+                "color_class": "special",
+                "ansi_color": "\x1b[35m",
+                "css_color": "#cc5de8"
+            })
+        
+        return color_info
+
     def get_ls_file_info(self, ssh_client, filename: str, current_dir: str) -> dict:
-        """获取文件详细信息（用于ls结构化输出）"""
+        """获取文件详细信息（增强版，包含颜色信息）"""
         try:
             # 使用stat命令获取文件详细信息
             stat_cmd = f"stat -c '%F|%a|%A' '{filename}'"
@@ -107,21 +216,27 @@ class SSHSessionManager:
                         is_executable = permissions[3] == 'x' or permissions[6] == 'x' or permissions[9] == 'x'
                         is_base = filename.lower() in ['base', 'miniconda', 'conda', 'anaconda']
                         
+                        # 获取颜色信息
+                        color_info = self.get_file_color_info(filename, file_type, is_executable, is_base)
+                        
                         return {
                             "name": filename,
                             "type": file_type,
                             "permissions": permissions[1:],  # 移除第一个字符（文件类型标识）
                             "is_executable": is_executable,
-                            "is_base": is_base
+                            "is_base": is_base,
+                            "color_info": color_info
                         }
                 
                 # 如果都失败，返回默认值
+                color_info = self.get_file_color_info(filename, "file", False, False)
                 return {
                     "name": filename,
                     "type": "file",
                     "permissions": "----------",
                     "is_executable": False,
-                    "is_base": False
+                    "is_base": False,
+                    "color_info": color_info
                 }
             
             # 解析stat输出: 文件类型|八进制权限|符号权限
@@ -148,26 +263,65 @@ class SSHSessionManager:
             # 判断是否是BASE路径
             is_base = filename.lower() in ['base', 'miniconda', 'conda', 'anaconda']
             
+            # 获取颜色信息
+            color_info = self.get_file_color_info(filename, file_type, is_executable, is_base)
+            
             return {
                 "name": filename,
                 "type": file_type,
                 "permissions": symbolic_perms,
                 "is_executable": is_executable,
-                "is_base": is_base
+                "is_base": is_base,
+                "color_info": color_info
             }
             
         except Exception as e:
             print(f"获取文件信息失败 {filename}: {e}")
+            color_info = self.get_file_color_info(filename, "file", False, False)
             return {
                 "name": filename,
                 "type": "file",
                 "permissions": "----------",
                 "is_executable": False,
-                "is_base": False
+                "is_base": False,
+                "color_info": color_info
             }
 
-    def process_ls_structured(self, ssh_client, command: str, session_id: str, current_dir: str) -> dict:
-        """处理ls命令，返回结构化数据"""
+    def format_ls_multicolumn(self, files, terminal_width=80):
+        """格式化文件列表为多列显示"""
+        if not files:
+            return {
+                "columns": 1,
+                "rows": [],
+                "column_width": 10
+            }
+        
+        # 计算最大文件名长度（考虑颜色代码空间）
+        max_name_length = max(len(f['name']) for f in files)
+        # 列宽（考虑颜色代码和间距）
+        column_width = max_name_length + 2
+        # 计算列数（预留一些边距）
+        num_columns = max(1, (terminal_width - 10) // column_width)
+        
+        # 按列排列文件（按行优先）
+        rows = []
+        files_per_row = (len(files) + num_columns - 1) // num_columns
+        
+        for i in range(files_per_row):
+            start_idx = i * num_columns
+            end_idx = min(start_idx + num_columns, len(files))
+            row_files = files[start_idx:end_idx]
+            rows.append(row_files)
+        
+        return {
+            "columns": num_columns,
+            "rows": rows,
+            "column_width": column_width,
+            "total_files": len(files)
+        }
+
+    def process_ls_structured(self, ssh_client, command: str, session_id: str, current_dir: str, terminal_width=80) -> dict:
+        """处理ls命令，返回结构化数据（支持横纵排列）"""
         try:
             # 提取ls命令的参数和路径
             import re
@@ -191,6 +345,9 @@ class SSHSessionManager:
                 file_info = self.get_ls_file_info(ssh_client, filename, current_dir)
                 file_info_list.append(file_info)
             
+            # 生成多列布局信息
+            multicolumn_info = self.format_ls_multicolumn(file_info_list, terminal_width)
+            
             # 获取当前提示符（模拟）
             prompt = f"(base) root@VM-0-15-ubuntu:{current_dir}# "
             
@@ -198,6 +355,7 @@ class SSHSessionManager:
                 "type": "ls_output",
                 "data": {
                     "files": file_info_list,
+                    "layout": multicolumn_info,
                     "prompt": prompt
                 }
             }
@@ -534,8 +692,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             current_dir = app.state.ssh_manager.get_cwd(session_id)
                             
                             # 尝试结构化输出（颜色支持）
+                            # 获取终端宽度（默认80列）
+                            terminal_width = 80  # 默认值
                             ls_structured = app.state.ssh_manager.process_ls_structured(
-                                ssh_client, command, session_id, current_dir
+                                ssh_client, command, session_id, current_dir, terminal_width
                             )
                             
                             if ls_structured and ls_structured["data"]["files"]:
@@ -543,9 +703,14 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 await websocket.send_text(json.dumps(ls_structured))
                                 
                                 # 发送提示符（模拟命令执行完成）
+                                # 修复：移除多余换行，确保格式正确
+                                prompt_text = ls_structured["data"]["prompt"].lstrip('\n')
+                                if not prompt_text.startswith('\n') and prompt_text != '':
+                                    prompt_text = '\n' + prompt_text
+                                
                                 prompt_response = {
                                     "type": "output",
-                                    "data": ls_structured["data"]["prompt"]
+                                    "data": prompt_text
                                 }
                                 await websocket.send_text(json.dumps(prompt_response))
                                 
