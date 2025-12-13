@@ -67,14 +67,16 @@ class SSHSessionManager:
                     # 相对路径
                     if current == '~':
                         # 如果当前是~，无法准确拼接，除非知道HOME。暂且保留~
-                        # 或者假设 ~ 就是 /root 或 /home/user，这里为了安全起见，
-                        # 如果是相对路径且当前是~，我们可能需要先获取一次pwd。
-                        # 这里简化处理，直接拼接，虽然可能不准确
-                        self.cwd_cache[session_id] = f"{current}/{path}"
+                        # 改进：如果当前是~，我们应该认为它是相对于用户的HOME目录
+                        # 为了补全能工作，我们保持路径为 ~/path
+                        self.cwd_cache[session_id] = f"~/{path}"
                     elif current == '/':
                          self.cwd_cache[session_id] = f"/{path}"
                     else:
                         self.cwd_cache[session_id] = f"{current}/{path}"
+            
+            # 调试输出
+            print(f"CWD更新: {self.cwd_cache.get(session_id)}")
 
     def get_cwd(self, session_id: str) -> str:
         with self.lock:
