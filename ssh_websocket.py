@@ -309,7 +309,34 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     data = re.sub(cmd_pattern, '', data)
                                     # 重置last_sent_command，避免多次过滤
                                     last_sent_command = None
-                            
+
+                            # 过滤不必要的系统状态行（如 Memory usage / IPv4 address 提示）
+                            try:
+                                import re as _re
+                                ansi = _re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+                                stripped = ansi.sub('', data)
+                                # 逐行过滤
+                                lines = data.replace('\r\n', '\n').split('\n')
+                                stripped_lines = stripped.replace('\r\n', '\n').split('\n')
+                                filtered = []
+                                drop_prefixes = [
+                                    'Memory usage:',
+                                    'IPv4 address for '
+                                ]
+                                for orig, s in zip(lines, stripped_lines):
+                                    s = s.strip()
+                                    if not s:
+                                        filtered.append(orig)
+                                        continue
+                                    if any(s.startswith(dp) for dp in drop_prefixes):
+                                        # 丢弃该行
+                                        continue
+                                    filtered.append(orig)
+                                data = '\n'.join(filtered)
+                            except Exception:
+                                # 过滤异常时忽略，继续输出
+                                pass
+
                             # 发送过滤后的输出
                             import time as _time
                             if _time.time() >= suppress_output_until:
@@ -357,7 +384,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     
                     if context_command:
                         try:
-                            suppress_output_until = time.time() + 0.5
+                            suppress_output_until = time.time() + 1.0
                             # 获取当前猜测的CWD
                             cwd = app.state.ssh_manager.get_cwd(session_id)
                             
@@ -440,63 +467,15 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 except Exception as _:
                                     pass
                             
-                            is_cd = (args and args[0] == 'cd')
-                            if context_command == tab_last_command and tab_last_options:
-                                if len(tab_last_options) > 0:
-                                    tab_cycle_index = (tab_cycle_index + 1) % len(tab_last_options)
-                                    cycle_item = tab_last_options[tab_cycle_index]
-                                    await websocket.send_text(json.dumps({
-                                        "type": "tab_complete_apply",
-                                        "data": {
-                                            "apply": cycle_item,
-                                            "base": last_word,
-                                            "is_dir": is_cd
-                                        }
-                                    }))
-                            else:
-                                tab_last_command = context_command
-                                tab_last_options = completions
-                                tab_cycle_index = -1
-                                tab_last_is_cd = is_cd
-                                if len(completions) == 1:
-                                    await websocket.send_text(json.dumps({
-                                        "type": "tab_complete_apply",
-                                        "data": {
-                                            "apply": completions[0],
-                                            "base": last_word,
-                                            "is_dir": is_cd
-                                        }
-                                    }))
-                                elif len(completions) > 1:
-                                    def _lcp(items):
-                                        if not items:
-                                            return ""
-                                        s1 = min(items)
-                                        s2 = max(items)
-                                        i = 0
-                                        m = min(len(s1), len(s2))
-                                        while i < m and s1[i] == s2[i]:
-                                            i += 1
-                                        return s1[:i]
-                                    lcp = _lcp(completions)
-                                    if lcp and len(lcp) > len(last_word):
-                                        await websocket.send_text(json.dumps({
-                                            "type": "tab_complete_prefix",
-                                            "data": {
-                                                "prefix": lcp,
-                                                "base": last_word,
-                                                "is_dir": is_cd
-                                            }
-                                        }))
-                                await websocket.send_text(json.dumps({
-                                    "type": "tab_completion_options",
-                                    "data": {
-                                        "options": completions,
-                                        "base": last_word,
-                                        "path_prefix": cwd if not is_command_completion else "",
-                                        "debug_error": err_data if not completions else ""
-                                    }
-                                }))
+                            await websocket.send_text(json.dumps({
+                                "type": "tab_completion_options",
+                                "data": {
+                                    "options": completions,
+                                    "base": last_word,
+                                    "path_prefix": cwd if not is_command_completion else "",
+                                    "debug_error": err_data if not completions else ""
+                                }
+                            }))
                             
                         except Exception as e:
                             print(f"智能补全失败: {e}")
@@ -510,8 +489,15 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 }
                             }))
                     else:
-                        # 无上下文，回退到发送制表符
-                        channel.send("\t")
+                        await websocket.send_text(json.dumps({
+                            "type": "tab_completion_options",
+                            "data": {
+                                "options": [],
+                                "base": "",
+                                "path_prefix": app.state.ssh_manager.get_cwd(session_id),
+                                "debug_error": ""
+                            }
+                        }))
                     
                 elif message["type"] == "tab_complete_result":
                     # 处理TAB补全结果
