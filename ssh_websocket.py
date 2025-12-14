@@ -48,18 +48,21 @@ class SSHSessionManager:
                 
             # 处理连续命令，如 cd /tmp && ls
             # 这里只做最简单的处理，假设命令以cd开头
-            if parts[0] == 'cd' and len(parts) > 1:
-                path = parts[1]
-                # 忽略复杂的情况，如变量等
-                if '$' in path or '`' in path:
-                    return
+            if parts[0] == 'cd':
+                # 处理不同的cd命令形式
+                if len(parts) == 1:
+                    # 仅 cd 命令，切换到主目录
+                    path = '~'
+                else:
+                    path = parts[1]
                 
-                # 修复：增强版 - 总是尝试获取真实的当前目录
+                # 对于所有cd命令，总是尝试在SSH服务器上执行并获取真实的当前目录
                 if ssh_client:
                     try:
                         # 执行cd命令后立即获取真实的当前目录
                         # 使用组合命令：先cd，再pwd
-                        combined_command = f"cd '{path}' && pwd"
+                        # 修复：使用更安全的命令执行方式，避免引号问题
+                        combined_command = f"cd {path} && pwd"
                         stdin, stdout, stderr = ssh_client.exec_command(combined_command, timeout=5)
                         real_cwd = stdout.read().decode('utf-8', errors='ignore').strip()
                         error_output = stderr.read().decode('utf-8', errors='ignore').strip()
@@ -76,16 +79,42 @@ class SSHSessionManager:
                 # 如果无法获取真实路径，使用本地逻辑推算
                 current = self.cwd_cache.get(session_id, '~')
                 
-                if path.startswith('/'):
+                if path == '~' or len(parts) == 1:
+                    # 切换到主目录
+                    # 尝试获取真实的主目录路径
+                    if ssh_client:
+                        try:
+                            stdin, stdout, stderr = ssh_client.exec_command("pwd", timeout=5)
+                            home_dir = stdout.read().decode('utf-8', errors='ignore').strip()
+                            if home_dir and not stderr.read().decode('utf-8', errors='ignore').strip():
+                                self.cwd_cache[session_id] = home_dir
+                                print(f"CWD主目录更新: {home_dir}")
+                                return
+                        except Exception as e:
+                            print(f"获取主目录失败: {e}")
+                    # 回退方案
+                    self.cwd_cache[session_id] = '~'
+                elif path.startswith('/'):
                     # 绝对路径
                     self.cwd_cache[session_id] = path
-                elif path == '~':
-                    self.cwd_cache[session_id] = '~'
                 elif path == '..':
                     # 本地逻辑处理上一级目录
                     if current == '~':
-                        # 从主目录返回，使用回退方案
-                        self.cwd_cache[session_id] = '/home'
+                        # 从主目录返回，尝试获取真实路径
+                        if ssh_client:
+                            try:
+                                # 先获取真实的主目录，再计算上一级
+                                stdin, stdout, stderr = ssh_client.exec_command("pwd", timeout=5)
+                                real_home = stdout.read().decode('utf-8', errors='ignore').strip()
+                                if real_home and not stderr.read().decode('utf-8', errors='ignore').strip():
+                                    parent = os.path.dirname(real_home.rstrip('/'))
+                                    self.cwd_cache[session_id] = parent or '/'
+                                    print(f"CWD上一级更新: {self.cwd_cache[session_id]}")
+                                    return
+                            except Exception as e:
+                                print(f"获取真实主目录失败: {e}")
+                        # 回退方案
+                        self.cwd_cache[session_id] = '/'
                     elif current == '/':
                         # 已经在根目录，保持不变
                         pass
@@ -94,10 +123,23 @@ class SSHSessionManager:
                         parent = os.path.dirname(current.rstrip('/'))
                         self.cwd_cache[session_id] = parent or '/'
                 elif path == '.':
+                    # 当前目录，保持不变
                     pass
                 else:
                     # 相对路径
                     if current == '~':
+                        # 相对主目录，尝试获取真实路径
+                        if ssh_client:
+                            try:
+                                stdin, stdout, stderr = ssh_client.exec_command(f"cd ~/{path} && pwd", timeout=5)
+                                real_path = stdout.read().decode('utf-8', errors='ignore').strip()
+                                if real_path and not stderr.read().decode('utf-8', errors='ignore').strip():
+                                    self.cwd_cache[session_id] = real_path
+                                    print(f"CWD相对路径更新: {real_path}")
+                                    return
+                            except Exception as e:
+                                print(f"获取真实相对路径失败: {e}")
+                        # 回退方案
                         self.cwd_cache[session_id] = f"~/{path}"
                     elif current == '/':
                          self.cwd_cache[session_id] = f"/{path}"
