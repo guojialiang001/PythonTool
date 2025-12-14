@@ -7,6 +7,8 @@ import asyncio
 import threading
 import json
 import time
+import os
+import re
 from contextlib import asynccontextmanager
 
 # SSH连接信息模型
@@ -362,7 +364,6 @@ class SSHSessionManager:
         """处理ls命令，返回结构化数据（支持横纵排列）"""
         try:
             # 提取ls命令的参数和路径
-            import re
             ls_match = re.match(r'^\s*ls\s*(.*)$', command)
             ls_args = ls_match.group(1) if ls_match else ""
             
@@ -640,7 +641,6 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         if last_sent_command:
                             # 处理命令回显，考虑ANSI转义序列
                             # 先处理可能包含控制字符的情况
-                            import re
                             # 创建一个正则表达式，匹配命令回显，忽略中间的控制序列
                             cmd_pattern = re.escape(last_sent_command) + r'(?:\x1b\[[0-9;]*[a-zA-Z])*\r\n'
                             if re.search(cmd_pattern, data):
@@ -651,8 +651,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
                         # 过滤不必要的系统状态行（如 Memory usage / IPv4 address 提示）
                         try:
-                            import re as _re
-                            ansi = _re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+                            ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
                             stripped = ansi.sub('', data)
                             # 逐行过滤
                             lines = data.replace('\r\n', '\n').split('\n')
@@ -679,14 +678,13 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
                         # 发送过滤后的输出
                         try:
-                            import re as _clean_re
                             data_for_send = data
                             # 移除常见ANSI CSI颜色/样式控制序列
-                            data_for_send = _clean_re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
+                            data_for_send = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
                             # 移除Bracketed Paste模式切换序列
-                            data_for_send = _clean_re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
+                            data_for_send = re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
                             # 移除OSC (Operating System Command) 序列，如设置终端标题
-                            data_for_send = _clean_re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", data_for_send)
+                            data_for_send = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", data_for_send)
                             # 统一换行符
                             data_for_send = data_for_send.replace("\r\n", "\n").replace("\r", "\n")
                         except Exception:
@@ -718,67 +716,67 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     command = message["data"]["command"]
                     # 移除命令末尾的换行符，避免发送多余的换行导致重复提示符
                     command = command.rstrip('\r\n')
-                    
+
+                    # 先添加命令到历史记录（所有命令都需要记录）
+                    app.state.ssh_manager.add_command_to_history(session_id, command)
+
                     # 检查是否为ls命令，尝试结构化输出
                     try:
-                        import re as _lsre
-                        simple_ls = _lsre.match(r"^\s*ls(\s|$)", command) is not None
+                        simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
                         has_ops = any(op in command for op in ['|', ';', '&&', '||'])
-                        
+
                         if simple_ls and not has_ops:
                             # 获取当前工作目录
                             current_dir = app.state.ssh_manager.get_cwd(session_id)
-                            
+
                             # 尝试结构化输出（颜色支持）
                             # 获取终端宽度（默认80列）
                             terminal_width = 80  # 默认值
                             ls_structured = app.state.ssh_manager.process_ls_structured(
                                 ssh_client, command, session_id, current_dir, terminal_width
                             )
-                            
+
                             if ls_structured and ls_structured["data"]["files"]:
                                 # 发送结构化输出
                                 await websocket.send_text(json.dumps(ls_structured))
-                                
+
                                 # 发送提示符（模拟命令执行完成）
-                                # 修复：避免输出重叠和多余换行
-                                prompt_text = ls_structured["data"]["prompt"].strip()
+                                # 修复：避免输出重叠和多余换行，按照文档要求移除前导换行
+                                prompt_text = ls_structured["data"]["prompt"].lstrip('\n')
                                 if prompt_text:
                                     # 确保只有一个换行在开头，避免重叠
                                     prompt_response = {
-                                        "type": "output", 
+                                        "type": "output",
                                         "data": "\n" + prompt_text
                                     }
                                     await websocket.send_text(json.dumps(prompt_response))
-                                
+
                                 # 跳过正常命令执行流程
                                 continue
                     except Exception as e:
                         print(f"结构化ls输出失败，回退到普通模式: {e}")
-                    
+
                     # 回退到普通ls处理（单列无颜色）
                     try:
-                        import re as _lsre
-                        simple_ls = _lsre.match(r"^\s*ls(\s|$)", command) is not None
+                        simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
                         has_ops = any(op in command for op in ['|', ';', '&&', '||'])
                         if simple_ls and not has_ops:
                             tail = command[len(command.split('ls', 1)[0]) + 2:] if 'ls' in command else ''
                             # 如果已有 -l 或 -1 或 --format=single-column，则不改写
-                            has_long = _lsre.search(r"(^|\s)-[^\s]*l", tail) is not None
+                            has_long = re.search(r"(^|\s)-[^\s]*l", tail) is not None
                             has_single = ('-1' in tail) or ('--format=single-column' in tail)
                             if not has_long and not has_single:
                                 # 将前缀 ls 改为 ls -1 --color=never，保留原尾部参数和路径
-                                command = _lsre.sub(r"^\s*ls", "ls -1 --color=never", command, count=1)
+                                command = re.sub(r"^\s*ls", "ls -1 --color=never", command, count=1)
                     except Exception:
                         pass
-                    
+
                     last_sent_command = command
                     channel.send(command + "\n")
-                    # 将命令添加到历史记录
-                    app.state.ssh_manager.add_command_to_history(session_id, command)
+
                     # 尝试更新CWD（传入ssh_client用于cd ..命令）
                     app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
-                    
+
                     # 修复：对于cd命令，延迟同步当前目录
                     if command.strip().startswith('cd '):
                         async def delayed_sync():
@@ -848,8 +846,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 
                                 out_raw = stdout.read().decode('utf-8', errors='ignore')
                                 err_data = stderr.read().decode('utf-8', errors='ignore')
-                                
-                                import re
+
                                 ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
                                 out_data = ansi.sub('', out_raw)
                                 all_files = [c.strip() for c in out_data.split('\n') if c.strip()]
@@ -943,13 +940,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         "type": "history_result",
                         "data": history_result
                     }))
-                    
-                elif message["type"] == "resize":
-                    # 调整终端大小
-                    cols = message["data"].get("cols", 80)
-                    rows = message["data"].get("rows", 24)
-                    channel.resize_pty(width=cols, height=rows)
-                    
+
                 elif message["type"] == "disconnect":
                     # 断开连接
                     break
