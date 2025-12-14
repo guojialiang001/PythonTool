@@ -33,6 +33,7 @@ class SSHSessionManager:
         self.websocket_connections: Dict[str, WebSocket] = {}
         self.command_history: Dict[str, list] = {}  # 存储每个会话的命令历史
         self.cwd_cache: Dict[str, str] = {} # 存储每个会话的当前工作目录（猜测值）
+        self.home_dir_cache: Dict[str, str] = {} # 存储每个会话的主目录
         self.lock = threading.Lock()
     
     def generate_session_id(self, connection: SSHConnection) -> str:
@@ -164,6 +165,17 @@ class SSHSessionManager:
             return self.cwd_cache.get(session_id, '~')
         
         try:
+            # 获取主目录
+            stdin, stdout, stderr = ssh_client.exec_command("echo $HOME", timeout=3)
+            home_dir = stdout.read().decode('utf-8', errors='ignore').strip()
+            error_output = stderr.read().decode('utf-8', errors='ignore').strip()
+            
+            if home_dir and not error_output:
+                with self.lock:
+                    self.home_dir_cache[session_id] = home_dir
+                print(f"HOME同步: {home_dir}")
+            
+            # 获取当前目录
             stdin, stdout, stderr = ssh_client.exec_command("pwd", timeout=3)
             real_cwd = stdout.read().decode('utf-8', errors='ignore').strip()
             error_output = stderr.read().decode('utf-8', errors='ignore').strip()
@@ -411,11 +423,45 @@ class SSHSessionManager:
             
             # 执行ls -1获取文件列表
             ls_cmd = f"ls -1 {ls_args}".strip()
-            stdin, stdout, stderr = ssh_client.exec_command(f"cd {current_dir} && {ls_cmd}", timeout=5)
+            # 修复：使用set -e确保cd命令失败时整个命令也失败
+            combined_ls_cmd = f"set -e && cd {current_dir} && {ls_cmd}"
+            stdin, stdout, stderr = ssh_client.exec_command(combined_ls_cmd, timeout=5)
             ls_output = stdout.read().decode('utf-8', errors='ignore').strip()
+            error_output = stderr.read().decode('utf-8', errors='ignore').strip()
             
-            if not ls_output:
+            if not ls_output and error_output:
+                # 如果有错误输出，说明命令失败，返回None
+                print(f"ls命令执行失败: {error_output}")
                 return None
+            elif not ls_output:
+                # 没有输出且没有错误，说明目录为空，返回空文件列表的结构化输出
+                print(f"ls命令返回空目录")
+                # 生成提示符
+                with self.lock:
+                    home_dir = self.home_dir_cache.get(session_id, '/root')
+
+                if current_dir == home_dir:
+                    display_dir = '~'
+                elif current_dir.startswith(home_dir + '/'):
+                    display_dir = '~' + current_dir[len(home_dir):]
+                else:
+                    display_dir = current_dir
+
+                prompt = f"(base) root@VM-0-15-ubuntu:{display_dir}# "
+
+                return {
+                    "type": "ls_output",
+                    "data": {
+                        "files": [],
+                        "layout": {
+                            "columns": 1,
+                            "rows": [],
+                            "column_width": 10,
+                            "total_files": 0
+                        },
+                        "prompt": prompt
+                    }
+                }
             
             # 解析文件列表
             files = [f.strip() for f in ls_output.split('\n') if f.strip()]
@@ -430,7 +476,18 @@ class SSHSessionManager:
             multicolumn_info = self.format_ls_multicolumn(file_info_list, terminal_width)
             
             # 获取当前提示符（模拟）
-            prompt = f"(base) root@VM-0-15-ubuntu:{current_dir}# "
+            # 使用~表示主目录
+            with self.lock:
+                home_dir = self.home_dir_cache.get(session_id, '/root')
+            
+            if current_dir == home_dir:
+                display_dir = '~'
+            elif current_dir.startswith(home_dir + '/'):
+                display_dir = '~' + current_dir[len(home_dir):]
+            else:
+                display_dir = current_dir
+            
+            prompt = f"(base) root@VM-0-15-ubuntu:{display_dir}# "
             
             return {
                 "type": "ls_output",
@@ -633,6 +690,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         channel.settimeout(1.0)  # 增加通道超时时间，提高稳定性
         print(f"创建shell通道成功")
         
+        # 连接成功后立即同步当前工作目录
+        # 这是修复初始路径和cd ..后路径执行ls命令效果一样的关键
+        app.state.ssh_manager.sync_current_directory(session_id, ssh_client)
+        
         # 发送连接成功消息
         # 发送 connected 类型消息（标准）
         connected_response = {
@@ -661,6 +722,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
         async def receive_ssh_output():
             nonlocal output_buffer, last_output_time
+            nonlocal is_expecting_pwd  # 访问外部作用域的变量
             while True:
                 try:
                     # 接收数据到缓冲区
@@ -670,6 +732,27 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             # 将数据添加到缓冲区
                             output_buffer += data
                             last_output_time = time.time()
+                            
+                            # 检查是否需要解析pwd结果
+                            if is_expecting_pwd:
+                                # 提取pwd命令的输出
+                                # 修复：查找pwd命令的输出，忽略所有命令回显
+                                # 更简单的方法：查找包含路径字符的行，忽略cd和pwd命令
+                                lines = output_buffer.split('\n')
+                                for i, line in enumerate(lines):
+                                    # 移除行尾的回车和空格
+                                    line = line.rstrip('\r\n ')
+                                    # 检查是否是有效的路径（包含/但不是命令）
+                                    if '/' in line and not line.startswith('cd ') and not line.startswith('pwd') and line.strip():
+                                        real_cwd = line.strip()
+                                        # 更新当前工作目录
+                                        app.state.ssh_manager.cwd_cache[session_id] = real_cwd
+                                        print(f"CWD从pwd更新: {real_cwd}")
+                                        # 重置标志
+                                        is_expecting_pwd = False
+                                        # 移除处理过的输出
+                                        output_buffer = '\n'.join(lines[i+1:])
+                                        break
                             
                     # 检查是否需要发送缓冲区内容
                     current_time = time.time()
@@ -740,12 +823,16 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                 except:
                     break
         
-        receive_task = asyncio.create_task(receive_ssh_output())
+        # 初始化变量
         last_sent_command = None
         tab_last_command = ""
         tab_last_options = []
         tab_cycle_index = -1
         tab_last_is_cd = False
+        is_expecting_pwd = False  # 标志，指示下一次输出需要解析pwd结果
+        
+        # 启动数据接收任务
+        receive_task = asyncio.create_task(receive_ssh_output())
         
         # 处理客户端消息
         while True:
@@ -778,18 +865,18 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 ssh_client, command, session_id, current_dir, terminal_width
                             )
 
-                            if ls_structured and ls_structured["data"]["files"]:
-                                # 发送结构化输出
+                            if ls_structured:
+                                # 发送结构化输出（包括空目录）
                                 await websocket.send_text(json.dumps(ls_structured))
 
                                 # 发送提示符（模拟命令执行完成）
                                 # 修复：避免输出重叠和多余换行，按照文档要求移除前导换行
                                 prompt_text = ls_structured["data"]["prompt"].lstrip('\n')
                                 if prompt_text:
-                                    # 确保只有一个换行在开头，避免重叠
+                                    # 直接发送提示符，不添加额外换行
                                     prompt_response = {
                                         "type": "output",
-                                        "data": "\n" + prompt_text
+                                        "data": prompt_text
                                     }
                                     await websocket.send_text(json.dumps(prompt_response))
 
@@ -814,20 +901,22 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         pass
 
                     last_sent_command = command
-                    channel.send(command + "\n")
-
-                    # 尝试更新CWD（传入ssh_client用于cd ..命令）
-                    app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
-
-                    # 修复：对于cd命令，延迟同步当前目录
+                    
+                    # 对于cd命令，在当前channel中执行，然后获取当前目录
                     if command.strip().startswith('cd '):
-                        async def delayed_sync():
-                            await asyncio.sleep(0.5)  # 等待cd命令执行完成
-                            try:
-                                app.state.ssh_manager.sync_current_directory(session_id, ssh_client)
-                            except Exception as e:
-                                print(f"延迟CWD同步失败: {e}")
-                        asyncio.create_task(delayed_sync())
+                        # 发送cd命令到SSH通道
+                        channel.send(command + "\n")
+                        # 发送pwd命令获取真实的当前目录
+                        channel.send("pwd\n")
+                        # 设置标志，指示下一次输出需要解析pwd结果
+                        is_expecting_pwd = True
+                        # 等待一段时间，让命令执行完成
+                        await asyncio.sleep(0.1)
+                    else:
+                        # 对于非cd命令，直接发送到SSH通道
+                        channel.send(command + "\n")
+                        # 尝试更新CWD（传入ssh_client用于其他命令）
+                        app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
                 elif message["type"] == "resize":
                     # 处理终端尺寸调整
                     if "data" in message and isinstance(message["data"], dict):
@@ -844,26 +933,34 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     context_command = ""
                     if "data" in message and isinstance(message["data"], dict) and "command" in message["data"]:
                         context_command = message["data"]["command"]
-                    
-                    if context_command:
+
+                    # 处理所有情况，包括空命令（应该补全命令列表）
+                    if "data" in message and isinstance(message["data"], dict):
                         output_paused.clear()
                         try:
                             # 获取当前猜测的CWD
                             cwd = app.state.ssh_manager.get_cwd(session_id)
-                            
+
                             # 分析最后一个词
                             # 注意：这里需要处理引号等复杂情况，但简单起见，我们只处理空格分割
-                            args = context_command.split()
-                            # 如果是以空格结尾，说明是在输入新的参数，last_word为空
-                            if context_command.endswith(" "):
+                            # 如果context_command为空，则补全命令
+                            if not context_command or not context_command.strip():
+                                # 空命令，补全所有命令
+                                args = []
                                 last_word = ""
+                                is_command_completion = True
                             else:
-                                last_word = args[-1] if args else ""
-                            
-                            # 决定补全类型
-                            # 如果是第一个词，或者前面是管道/分号等，尝试命令补全
-                            # 简单判断：如果是第一个词，补全命令
-                            is_command_completion = len(args) <= 1 and not context_command.endswith(" ")
+                                args = context_command.split()
+                                # 如果是以空格结尾，说明是在输入新的参数，last_word为空
+                                if context_command.endswith(" "):
+                                    last_word = ""
+                                else:
+                                    last_word = args[-1] if args else ""
+
+                                # 决定补全类型
+                                # 如果是第一个词，或者前面是管道/分号等，尝试命令补全
+                                # 简单判断：如果是第一个词，补全命令
+                                is_command_completion = len(args) <= 1 and not context_command.endswith(" ")
                             
                             completions = []
                             err_data = ""
@@ -892,9 +989,9 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
                                 out_data = ansi.sub('', out_raw)
                                 all_files = [c.strip() for c in out_data.split('\n') if c.strip()]
-                                
+
                                 # 在 Python 端进行过滤
-                                if args[0] == 'cd':
+                                if args and args[0] == 'cd':
                                     # cd 命令只补全目录（以 / 结尾的项）
                                     # 过滤出以 last_word 开头 且 以 / 结尾的项
                                     filtered = [f for f in all_files if f.startswith(last_word) and f.endswith('/')]
@@ -955,15 +1052,19 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             await asyncio.sleep(0.1) # 等待一小段时间，让可能的垃圾输出被丢弃
                             output_paused.set()
                     else:
-                        await websocket.send_text(json.dumps({
-                            "type": "tab_completion_options",
-                            "data": {
-                                "options": [],
-                                "base": "",
-                                "path_prefix": app.state.ssh_manager.get_cwd(session_id),
-                                "debug_error": ""
-                            }
-                        }))
+                        # 如果消息格式不正确，发送空结果
+                        try:
+                            await websocket.send_text(json.dumps({
+                                "type": "tab_completion_options",
+                                "data": {
+                                    "options": [],
+                                    "base": "",
+                                    "path_prefix": app.state.ssh_manager.get_cwd(session_id),
+                                    "debug_error": "Invalid message format"
+                                }
+                            }))
+                        except Exception as e:
+                            print(f"发送tab补全响应失败: {e}")
                     
                 elif message["type"] == "tab_complete_result":
                     # 处理TAB补全结果
@@ -982,6 +1083,36 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         "type": "history_result",
                         "data": history_result
                     }))
+                    
+                elif message["type"] == "ctrl_command":
+                    # 处理CTRL按键命令
+                    ctrl_command = message["data"].get("command", "")
+                    print(f"接收到CTRL命令: {ctrl_command}")
+                    # 根据CTRL命令发送相应的控制字符
+                    if ctrl_command == "c":
+                        # CTRL+C - 中断当前命令
+                        channel.send(chr(3))
+                    elif ctrl_command == "d":
+                        # CTRL+D - EOF
+                        channel.send(chr(4))
+                    elif ctrl_command == "z":
+                        # CTRL+Z - 暂停当前命令
+                        channel.send(chr(26))
+                    elif ctrl_command == "l":
+                        # CTRL+L - 清屏
+                        channel.send(chr(12))
+                    elif ctrl_command == "a":
+                        # CTRL+A - 移动到行首
+                        channel.send(chr(1))
+                    elif ctrl_command == "e":
+                        # CTRL+E - 移动到行尾
+                        channel.send(chr(5))
+                    elif ctrl_command == "k":
+                        # CTRL+K - 删除从光标到行尾的内容
+                        channel.send(chr(11))
+                    elif ctrl_command == "u":
+                        # CTRL+U - 删除从光标到行首的内容
+                        channel.send(chr(21))
 
                 elif message["type"] == "disconnect":
                     # 断开连接
