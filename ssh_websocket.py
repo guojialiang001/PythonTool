@@ -723,7 +723,6 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
         async def receive_ssh_output():
             nonlocal output_buffer, last_output_time
-            nonlocal is_expecting_pwd
             while True:
                 try:
                     if channel.recv_ready() and output_paused.is_set():
@@ -732,44 +731,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             output_buffer += data
                             last_output_time = time.time()
 
-                            if is_expecting_pwd:
-                                # 添加：超时检查，避免无限等待
-                                nonlocal pwd_wait_start_time
-                                if time.time() - pwd_wait_start_time > 3.0:  # 3秒超时
-                                    print(f"[CWD] pwd 超时 (等待 {time.time() - pwd_wait_start_time:.2f}秒)，放弃等待")
-                                    is_expecting_pwd = False
-                                    pwd_wait_start_time = 0
-                                    # 修复：不要清空 buffer，让后续正常处理，避免阻塞 Tab/Ctrl
-
-                                # 尝试从当前 buffer 中提取 pwd 输出，但不阻塞其他输出
-                                lines = output_buffer.split('\n')
-                                pwd_line_index = -1
-
-                                for i, line in enumerate(lines):
-                                    line_clean = line.rstrip('\r\n ')
-                                    # 清理 ANSI 序列后检查
-                                    line_stripped = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line_clean).strip()
-                                    line_stripped = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", line_stripped).strip()
-
-                                    # 检查是否是 pwd 输出（只包含路径）
-                                    if line_stripped and line_stripped.startswith('/') and not any(x in line_stripped for x in ['cd ', 'pwd', '@', '#']):
-                                        real_cwd = line_stripped
-                                        app.state.ssh_manager.cwd_cache[session_id] = real_cwd
-                                        print(f"[CWD] 从pwd更新: {real_cwd}")
-                                        is_expecting_pwd = False
-                                        pwd_wait_start_time = 0
-                                        pwd_line_index = i
-                                        break
-
-                                # 如果找到了 pwd 输出，从 buffer 中移除它（但保留其他内容）
-                                if pwd_line_index >= 0:
-                                    # 移除 pwd 行，保留其他所有内容
-                                    lines.pop(pwd_line_index)
-                                    output_buffer = '\n'.join(lines)
-                                    print(f"[CWD] 移除 pwd 行后 buffer 剩余: {len(output_buffer)} 字节")
-
-                                # 修复：不要 continue，让后续正常处理 output_buffer
-                                # 这样可以避免阻塞 Tab 补全和 Ctrl 键的响应
+                    # 修复：移除 is_expecting_pwd 的阻塞逻辑
+                    # cd 命令现在通过后台 exec_command 获取 pwd，不会干扰用户输入
 
                     current_time = time.time()
                     if output_buffer and (current_time - last_output_time > OUTPUT_MERGE_TIMEOUT):
@@ -824,8 +787,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
         # 初始化变量
         last_sent_command = None
-        is_expecting_pwd = False
-        pwd_wait_start_time = 0  # 添加：记录开始等待 pwd 的时间
+        # 移除 is_expecting_pwd 和 pwd_wait_start_time，不再需要
 
         # 启动接收任务
         receive_task = asyncio.create_task(receive_ssh_output())
@@ -935,12 +897,34 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     last_sent_command = command
 
                     # cd命令特殊处理
+                    # 修复：不要通过 channel.send pwd，会干扰用户输入（Tab/Ctrl）
+                    # 改为通过 exec_command 在后台获取 pwd，不影响用户操作
                     if command.strip().startswith('cd '):
                         channel.send(command + "\n")
-                        channel.send("pwd\n")
-                        is_expecting_pwd = True
-                        pwd_wait_start_time = time.time()  # 添加：记录开始等待的时间
-                        await asyncio.sleep(0.1)
+                        # 不再发送 pwd 到channel，改为后台执行
+                        # channel.send("pwd\n")  # 删除：这会干扰用户输入
+
+                        # 后台获取当前目录，不干扰用户输入
+                        try:
+                            # 提取 cd 的目标路径
+                            cd_parts = command.strip().split(maxsplit=1)
+                            if len(cd_parts) > 1:
+                                target = cd_parts[1]
+                            else:
+                                target = '~'
+
+                            # 后台执行获取真实路径
+                            pwd_cmd = f"cd {target} 2>/dev/null && pwd || echo $HOME"
+                            stdin, stdout, stderr = ssh_client.exec_command(pwd_cmd, timeout=2)
+                            real_cwd = stdout.read().decode('utf-8', errors='ignore').strip()
+
+                            if real_cwd and real_cwd.startswith('/'):
+                                app.state.ssh_manager.cwd_cache[session_id] = real_cwd
+                                print(f"[CWD] 后台更新: {real_cwd}")
+                        except Exception as e:
+                            print(f"[CWD] 后台更新失败: {e}")
+                            # 失败时使用本地逻辑更新
+                            app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
                     else:
                         channel.send(command + "\n")
                         app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
