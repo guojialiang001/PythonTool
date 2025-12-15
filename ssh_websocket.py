@@ -1032,12 +1032,6 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 }
                             }))
                         finally:
-                            # 丢弃tab补全期间可能产生的SSH通道缓冲数据（如shell原生补全输出）
-                            try:
-                                while channel.recv_ready():
-                                    channel.recv(4096)
-                            except:
-                                pass
                             # 无论如何，恢复输出
                             await asyncio.sleep(0.1) # 等待一小段时间，让可能的垃圾输出被丢弃
                             output_paused.set()
