@@ -849,46 +849,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     # 先添加命令到历史记录（所有命令都需要记录）
                     app.state.ssh_manager.add_command_to_history(session_id, command)
 
-                    # 检查是否为ls命令，尝试结构化输出
-                    try:
-                        simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
-                        has_ops = any(op in command for op in ['|', ';', '&&', '||'])
-
-                        if simple_ls and not has_ops:
-                            # 获取当前工作目录
-                            current_dir = app.state.ssh_manager.get_cwd(session_id)
-
-                            # 尝试结构化输出（颜色支持）
-                            # 获取终端宽度（默认80列）
-                            terminal_width = 80  # 默认值
-                            ls_structured = app.state.ssh_manager.process_ls_structured(
-                                ssh_client, command, session_id, current_dir, terminal_width
-                            )
-
-                            if ls_structured:
-                                # 发送结构化输出（包括空目录）
-                                # 提示符已包含在ls_structured数据中，无需单独发送
-                                await websocket.send_text(json.dumps(ls_structured))
-
-                                # 跳过正常命令执行流程
-                                continue
-                    except Exception as e:
-                        print(f"结构化ls输出失败，回退到普通模式: {e}")
-
-                    # 回退到普通ls处理（单列无颜色）
-                    try:
-                        simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
-                        has_ops = any(op in command for op in ['|', ';', '&&', '||'])
-                        if simple_ls and not has_ops:
-                            tail = command[len(command.split('ls', 1)[0]) + 2:] if 'ls' in command else ''
-                            # 如果已有 -l 或 -1 或 --format=single-column，则不改写
-                            has_long = re.search(r"(^|\s)-[^\s]*l", tail) is not None
-                            has_single = ('-1' in tail) or ('--format=single-column' in tail)
-                            if not has_long and not has_single:
-                                # 将前缀 ls 改为 ls -1 --color=never，保留原尾部参数和路径
-                                command = re.sub(r"^\s*ls", "ls -1 --color=never", command, count=1)
-                    except Exception:
-                        pass
+                    # ls命令现在作为普通命令处理，保留颜色输出
+                    # 不再使用特殊的结构化输出，确保颜色正常显示
 
                     last_sent_command = command
                     
