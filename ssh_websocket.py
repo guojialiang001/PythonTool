@@ -867,18 +867,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
                             if ls_structured:
                                 # 发送结构化输出（包括空目录）
+                                # 提示符已包含在ls_structured数据中，无需单独发送
                                 await websocket.send_text(json.dumps(ls_structured))
-
-                                # 发送提示符（模拟命令执行完成）
-                                # 修复：避免输出重叠和多余换行，按照文档要求移除前导换行
-                                prompt_text = ls_structured["data"]["prompt"].lstrip('\n')
-                                if prompt_text:
-                                    # 直接发送提示符，不添加额外换行
-                                    prompt_response = {
-                                        "type": "output",
-                                        "data": prompt_text
-                                    }
-                                    await websocket.send_text(json.dumps(prompt_response))
 
                                 # 跳过正常命令执行流程
                                 continue
