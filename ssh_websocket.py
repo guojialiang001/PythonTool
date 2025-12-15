@@ -739,11 +739,12 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     print(f"[CWD] pwd 超时 (等待 {time.time() - pwd_wait_start_time:.2f}秒)，放弃等待")
                                     is_expecting_pwd = False
                                     pwd_wait_start_time = 0
-                                    output_buffer = ""  # 清空 buffer，丢弃可能混乱的内容
-                                    continue
+                                    # 修复：不要清空 buffer，让后续正常处理，避免阻塞 Tab/Ctrl
 
+                                # 尝试从当前 buffer 中提取 pwd 输出，但不阻塞其他输出
                                 lines = output_buffer.split('\n')
-                                pwd_found = False
+                                pwd_line_index = -1
+
                                 for i, line in enumerate(lines):
                                     line_clean = line.rstrip('\r\n ')
                                     # 清理 ANSI 序列后检查
@@ -757,20 +758,18 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                         print(f"[CWD] 从pwd更新: {real_cwd}")
                                         is_expecting_pwd = False
                                         pwd_wait_start_time = 0
-                                        pwd_found = True
-
-                                        # 清空 pwd 输出及之前的所有内容，保留之后的内容
-                                        # 这样可以保留新的提示符
-                                        remaining_lines = lines[i+1:]
-                                        output_buffer = '\n'.join(remaining_lines)
-                                        print(f"[CWD] 清理后 buffer 剩余: {len(output_buffer)} 字节")
+                                        pwd_line_index = i
                                         break
 
-                                # 如果找到了 pwd 但没有后续内容，等待新的提示符
-                                if pwd_found and not output_buffer.strip():
-                                    # 短暂等待让 SSH 输出新的提示符
-                                    await asyncio.sleep(0.05)
-                                    continue
+                                # 如果找到了 pwd 输出，从 buffer 中移除它（但保留其他内容）
+                                if pwd_line_index >= 0:
+                                    # 移除 pwd 行，保留其他所有内容
+                                    lines.pop(pwd_line_index)
+                                    output_buffer = '\n'.join(lines)
+                                    print(f"[CWD] 移除 pwd 行后 buffer 剩余: {len(output_buffer)} 字节")
+
+                                # 修复：不要 continue，让后续正常处理 output_buffer
+                                # 这样可以避免阻塞 Tab 补全和 Ctrl 键的响应
 
                     current_time = time.time()
                     if output_buffer and (current_time - last_output_time > OUTPUT_MERGE_TIMEOUT):
