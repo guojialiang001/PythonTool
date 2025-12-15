@@ -689,7 +689,17 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         channel = ssh_client.invoke_shell(term='xterm', width=connection.width, height=connection.height)
         channel.settimeout(1.0)  # 增加通道超时时间，提高稳定性
         print(f"创建shell通道成功")
-        
+
+        # 立即执行MOTD过滤命令，抑制登录提示信息
+        motd_filter_cmd = (
+            'touch ~/.hushlogin 2>/dev/null; '
+            'export MOTD_SHOWN=puppet DEBIAN_FRONTEND=noninteractive; '
+            'unset MAILCHECK MAIL\n'
+        )
+        channel.send(motd_filter_cmd)
+        # 短暂等待命令执行完成
+        await asyncio.sleep(0.1)
+
         # 连接成功后立即同步当前工作目录
         # 这是修复初始路径和cd ..后路径执行ls命令效果一样的关键
         app.state.ssh_manager.sync_current_directory(session_id, ssh_client)
