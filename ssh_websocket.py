@@ -446,15 +446,18 @@ class SSHSessionManager:
 
             ls_cmd = f"ls -1 {ls_args}".strip()
             combined_ls_cmd = f"set -e && cd '{current_dir}' && {ls_cmd}"
+            print(f"[LS] 执行命令: {combined_ls_cmd} (当前目录: {current_dir})")
             stdin, stdout, stderr = ssh_client.exec_command(combined_ls_cmd, timeout=5)
             ls_output = stdout.read().decode('utf-8', errors='ignore').strip()
             error_output = stderr.read().decode('utf-8', errors='ignore').strip()
+
+            print(f"[LS] 输出长度: {len(ls_output)}, 错误: {error_output[:100] if error_output else 'None'}")
 
             if not ls_output and error_output:
                 print(f"[LS] 执行失败: {error_output}")
                 return None
             elif not ls_output:
-                print(f"[LS] 空目录")
+                print(f"[LS] 空目录 (current_dir={current_dir})")
                 with self.lock:
                     home_dir = self.home_dir_cache.get(session_id, '/root')
 
@@ -482,6 +485,7 @@ class SSHSessionManager:
                 }
 
             files = [f.strip() for f in ls_output.split('\n') if f.strip()]
+            print(f"[LS] 找到 {len(files)} 个文件")
 
             file_info_list = []
             for filename in files:
@@ -513,6 +517,8 @@ class SSHSessionManager:
 
         except Exception as e:
             print(f"[LS] 处理失败: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def add_command_to_history(self, session_id: str, command: str):
@@ -727,23 +733,44 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             last_output_time = time.time()
 
                             if is_expecting_pwd:
+                                # 添加：超时检查，避免无限等待
+                                nonlocal pwd_wait_start_time
+                                if time.time() - pwd_wait_start_time > 3.0:  # 3秒超时
+                                    print(f"[CWD] pwd 超时 (等待 {time.time() - pwd_wait_start_time:.2f}秒)，放弃等待")
+                                    is_expecting_pwd = False
+                                    pwd_wait_start_time = 0
+                                    output_buffer = ""  # 清空 buffer，丢弃可能混乱的内容
+                                    continue
+
                                 lines = output_buffer.split('\n')
+                                pwd_found = False
                                 for i, line in enumerate(lines):
-                                    line = line.rstrip('\r\n ')
-                                    if '/' in line and not line.startswith('cd ') and not line.startswith('pwd') and line.strip():
-                                        # 清理ANSI转义序列，确保路径纯净
-                                        real_cwd = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line).strip()
+                                    line_clean = line.rstrip('\r\n ')
+                                    # 清理 ANSI 序列后检查
+                                    line_stripped = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line_clean).strip()
+                                    line_stripped = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", line_stripped).strip()
+
+                                    # 检查是否是 pwd 输出（只包含路径）
+                                    if line_stripped and line_stripped.startswith('/') and not any(x in line_stripped for x in ['cd ', 'pwd', '@', '#']):
+                                        real_cwd = line_stripped
                                         app.state.ssh_manager.cwd_cache[session_id] = real_cwd
                                         print(f"[CWD] 从pwd更新: {real_cwd}")
                                         is_expecting_pwd = False
+                                        pwd_wait_start_time = 0
+                                        pwd_found = True
 
-                                        # 修复：移除手动发送提示符，让 SSH 通道自然输出
-                                        # 只保留目录更新逻辑，不再手动构造和发送提示符
-                                        # 这样可以避免提示符重复问题
-
-                                        # 清空 pwd 命令的输出行，保留后续的提示符
-                                        output_buffer = '\n'.join(lines[i+1:])
+                                        # 清空 pwd 输出及之前的所有内容，保留之后的内容
+                                        # 这样可以保留新的提示符
+                                        remaining_lines = lines[i+1:]
+                                        output_buffer = '\n'.join(remaining_lines)
+                                        print(f"[CWD] 清理后 buffer 剩余: {len(output_buffer)} 字节")
                                         break
+
+                                # 如果找到了 pwd 但没有后续内容，等待新的提示符
+                                if pwd_found and not output_buffer.strip():
+                                    # 短暂等待让 SSH 输出新的提示符
+                                    await asyncio.sleep(0.05)
+                                    continue
 
                     current_time = time.time()
                     if output_buffer and (current_time - last_output_time > OUTPUT_MERGE_TIMEOUT):
@@ -799,6 +826,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         # 初始化变量
         last_sent_command = None
         is_expecting_pwd = False
+        pwd_wait_start_time = 0  # 添加：记录开始等待 pwd 的时间
 
         # 启动接收任务
         receive_task = asyncio.create_task(receive_ssh_output())
@@ -823,6 +851,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
                         if simple_ls and not has_ops:
                             current_dir = app.state.ssh_manager.get_cwd(session_id)
+                            print(f"[LS] 获取当前目录: {current_dir} (session_id: {session_id})")
                             terminal_width = 80
                             ls_structured = app.state.ssh_manager.process_ls_structured(
                                 ssh_client, command, session_id, current_dir, terminal_width
@@ -911,6 +940,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         channel.send(command + "\n")
                         channel.send("pwd\n")
                         is_expecting_pwd = True
+                        pwd_wait_start_time = time.time()  # 添加：记录开始等待的时间
                         await asyncio.sleep(0.1)
                     else:
                         channel.send(command + "\n")
