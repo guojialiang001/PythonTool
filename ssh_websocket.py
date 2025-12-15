@@ -327,13 +327,13 @@ class SSHSessionManager:
         """获取文件详细信息(包含颜色)"""
         try:
             stat_cmd = f"stat -c '%F|%a|%A' '{filename}'"
-            stdin, stdout, stderr = ssh_client.exec_command(f"cd {current_dir} && {stat_cmd}", timeout=5)
+            stdin, stdout, stderr = ssh_client.exec_command(f"cd '{current_dir}' && {stat_cmd}", timeout=5)
             stat_output = stdout.read().decode('utf-8', errors='ignore').strip()
 
             if not stat_output:
                 # 使用ls -ld作为备选
                 ls_cmd = f"ls -ld '{filename}'"
-                stdin, stdout, stderr = ssh_client.exec_command(f"cd {current_dir} && {ls_cmd}", timeout=5)
+                stdin, stdout, stderr = ssh_client.exec_command(f"cd '{current_dir}' && {ls_cmd}", timeout=5)
                 ls_output = stdout.read().decode('utf-8', errors='ignore').strip()
 
                 if ls_output:
@@ -445,7 +445,7 @@ class SSHSessionManager:
             ls_args = ls_match.group(1) if ls_match else ""
 
             ls_cmd = f"ls -1 {ls_args}".strip()
-            combined_ls_cmd = f"set -e && cd {current_dir} && {ls_cmd}"
+            combined_ls_cmd = f"set -e && cd '{current_dir}' && {ls_cmd}"
             stdin, stdout, stderr = ssh_client.exec_command(combined_ls_cmd, timeout=5)
             ls_output = stdout.read().decode('utf-8', errors='ignore').strip()
             error_output = stderr.read().decode('utf-8', errors='ignore').strip()
@@ -731,7 +731,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 for i, line in enumerate(lines):
                                     line = line.rstrip('\r\n ')
                                     if '/' in line and not line.startswith('cd ') and not line.startswith('pwd') and line.strip():
-                                        real_cwd = line.strip()
+                                        # 清理ANSI转义序列，确保路径纯净
+                                        real_cwd = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line).strip()
                                         app.state.ssh_manager.cwd_cache[session_id] = real_cwd
                                         print(f"[CWD] 从pwd更新: {real_cwd}")
                                         is_expecting_pwd = False
