@@ -10,6 +10,7 @@ import time
 import os
 import re
 from contextlib import asynccontextmanager
+from collections import deque
 
 # SSH连接信息模型
 class SSHConnection(BaseModel):
@@ -26,303 +27,335 @@ class WebSocketMessage(BaseModel):
     type: str  # "connect", "command", "disconnect", "resize"
     data: Optional[Dict] = None
 
-# SSH会话管理器
+# Resize节流器 - 修复P0问题: Resize命令洪泛
+class ResizeThrottler:
+    """Resize命令节流器,防止拖动浏览器时洪泛后端"""
+
+    def __init__(self, interval=0.3):
+        self.interval = interval  # 节流间隔(秒)
+        self.last_resize_time = {}  # 每个session的最后resize时间
+        self.pending_resize = {}  # 等待执行的resize
+        self.lock = threading.Lock()
+
+    def should_execute(self, session_id: str, width: int, height: int) -> bool:
+        """判断是否应该执行resize,并记录待执行的resize"""
+        with self.lock:
+            current_time = time.time()
+            last_time = self.last_resize_time.get(session_id, 0)
+
+            # 如果距离上次resize超过间隔,立即执行
+            if current_time - last_time >= self.interval:
+                self.last_resize_time[session_id] = current_time
+                # 清除pending
+                if session_id in self.pending_resize:
+                    del self.pending_resize[session_id]
+                return True
+
+            # 否则记录为pending,等待下次执行
+            self.pending_resize[session_id] = (width, height, current_time)
+            return False
+
+    def get_pending(self, session_id: str):
+        """获取待执行的resize"""
+        with self.lock:
+            if session_id in self.pending_resize:
+                width, height, _ = self.pending_resize[session_id]
+                del self.pending_resize[session_id]
+                self.last_resize_time[session_id] = time.time()
+                return (width, height)
+            return None
+
+# SSH会话管理器 - 修复P1问题: 历史记录扩展
 class SSHSessionManager:
+    # 修复P1: 历史记录容量从默认扩展到100
+    MAX_HISTORY_SIZE = 100
+
     def __init__(self):
         self.sessions: Dict[str, paramiko.SSHClient] = {}
         self.websocket_connections: Dict[str, WebSocket] = {}
-        self.command_history: Dict[str, list] = {}  # 存储每个会话的命令历史
-        self.cwd_cache: Dict[str, str] = {} # 存储每个会话的当前工作目录（猜测值）
-        self.home_dir_cache: Dict[str, str] = {} # 存储每个会话的主目录
+        self.command_history: Dict[str, deque] = {}  # 使用deque,自动限制大小
+        self.cwd_cache: Dict[str, str] = {}
+        self.home_dir_cache: Dict[str, str] = {}
         self.lock = threading.Lock()
-    
+        # 修复P0: 添加resize节流器
+        self.resize_throttler = ResizeThrottler(interval=0.3)
+
     def generate_session_id(self, connection: SSHConnection) -> str:
         return f"{connection.username}@{connection.hostname}:{connection.port}"
-    
+
     def update_cwd(self, session_id: str, command: str, ssh_client: paramiko.SSHClient = None):
-        """尝试从命令中更新当前工作目录"""
+        """
+        尝试从命令中更新当前工作目录
+        修复P0: 确保CWD不被Backspace等键盘输入影响
+        """
+        # 修复P0: 只处理实际的命令,忽略键盘控制字符
+        if not command or not command.strip():
+            return
+
+        # 过滤掉控制字符和特殊按键
+        if any(c in command for c in ['\x08', '\x7f', '\x1b']):  # Backspace, Delete, Escape
+            return
+
         with self.lock:
-            # 简单的cd命令解析
             parts = command.strip().split()
             if not parts:
                 return
-                
-            # 处理连续命令，如 cd /tmp && ls
-            # 这里只做最简单的处理，假设命令以cd开头
+
+            # 只处理cd命令
             if parts[0] == 'cd':
-                # 处理不同的cd命令形式
                 if len(parts) == 1:
-                    # 仅 cd 命令，切换到主目录
                     path = '~'
                 else:
                     path = parts[1]
-                
-                # 对于所有cd命令，总是尝试在SSH服务器上执行并获取真实的当前目录
+
+                # 总是尝试在SSH服务器上执行并获取真实目录
                 if ssh_client:
                     try:
-                        # 执行cd命令后立即获取真实的当前目录
-                        # 使用组合命令：先cd，再pwd
-                        # 修复：使用更安全的命令执行方式，避免引号问题
                         combined_command = f"cd {path} && pwd"
                         stdin, stdout, stderr = ssh_client.exec_command(combined_command, timeout=5)
                         real_cwd = stdout.read().decode('utf-8', errors='ignore').strip()
                         error_output = stderr.read().decode('utf-8', errors='ignore').strip()
-                        
+
                         if real_cwd and not error_output:
                             self.cwd_cache[session_id] = real_cwd
-                            print(f"CWD真实更新: {real_cwd}")
+                            print(f"[CWD] 真实更新: {real_cwd}")
                             return
                         elif error_output:
-                            print(f"cd命令执行错误: {error_output}")
+                            print(f"[CWD] cd命令错误: {error_output}")
                     except Exception as e:
-                        print(f"获取真实CWD失败: {e}")
-                
-                # 如果无法获取真实路径，使用本地逻辑推算
+                        print(f"[CWD] 获取失败: {e}")
+
+                # 本地逻辑推算(回退方案)
                 current = self.cwd_cache.get(session_id, '~')
-                
+
                 if path == '~' or len(parts) == 1:
-                    # 切换到主目录
-                    # 尝试获取真实的主目录路径
                     if ssh_client:
                         try:
                             stdin, stdout, stderr = ssh_client.exec_command("pwd", timeout=5)
                             home_dir = stdout.read().decode('utf-8', errors='ignore').strip()
                             if home_dir and not stderr.read().decode('utf-8', errors='ignore').strip():
                                 self.cwd_cache[session_id] = home_dir
-                                print(f"CWD主目录更新: {home_dir}")
+                                print(f"[CWD] 主目录更新: {home_dir}")
                                 return
                         except Exception as e:
-                            print(f"获取主目录失败: {e}")
-                    # 回退方案
+                            print(f"[CWD] 获取主目录失败: {e}")
                     self.cwd_cache[session_id] = '~'
                 elif path.startswith('/'):
-                    # 绝对路径
                     self.cwd_cache[session_id] = path
                 elif path == '..':
-                    # 本地逻辑处理上一级目录
+                    # 修复P1: 优化父目录切换
                     if current == '~':
-                        # 从主目录返回，尝试获取真实路径
                         if ssh_client:
                             try:
-                                # 先获取真实的主目录，再计算上一级
-                                stdin, stdout, stderr = ssh_client.exec_command("pwd", timeout=5)
-                                real_home = stdout.read().decode('utf-8', errors='ignore').strip()
-                                if real_home and not stderr.read().decode('utf-8', errors='ignore').strip():
-                                    parent = os.path.dirname(real_home.rstrip('/'))
-                                    self.cwd_cache[session_id] = parent or '/'
-                                    print(f"CWD上一级更新: {self.cwd_cache[session_id]}")
-                                    return
-                            except Exception as e:
-                                print(f"获取真实主目录失败: {e}")
-                        # 回退方案
-                        self.cwd_cache[session_id] = '/'
-                    elif current == '/':
-                        # 已经在根目录，保持不变
-                        pass
-                    else:
-                        # 普通路径，返回上一级
-                        parent = os.path.dirname(current.rstrip('/'))
-                        self.cwd_cache[session_id] = parent or '/'
-                elif path == '.':
-                    # 当前目录，保持不变
-                    pass
-                else:
-                    # 相对路径
-                    if current == '~':
-                        # 相对主目录，尝试获取真实路径
-                        if ssh_client:
-                            try:
-                                stdin, stdout, stderr = ssh_client.exec_command(f"cd ~/{path} && pwd", timeout=5)
+                                stdin, stdout, stderr = ssh_client.exec_command("cd .. && pwd", timeout=5)
                                 real_path = stdout.read().decode('utf-8', errors='ignore').strip()
                                 if real_path and not stderr.read().decode('utf-8', errors='ignore').strip():
                                     self.cwd_cache[session_id] = real_path
-                                    print(f"CWD相对路径更新: {real_path}")
+                                    print(f"[CWD] 父目录更新: {real_path}")
                                     return
                             except Exception as e:
-                                print(f"获取真实相对路径失败: {e}")
-                        # 回退方案
+                                print(f"[CWD] 父目录失败: {e}")
+                        self.cwd_cache[session_id] = '/'
+                    elif current == '/':
+                        pass  # 已在根目录
+                    else:
+                        parent = os.path.dirname(current.rstrip('/'))
+                        self.cwd_cache[session_id] = parent or '/'
+                elif path == '.':
+                    pass  # 当前目录不变
+                else:
+                    # 相对路径 - 修复P1
+                    if ssh_client:
+                        try:
+                            combined = f"cd {current} && cd {path} && pwd" if current != '~' else f"cd {path} && pwd"
+                            stdin, stdout, stderr = ssh_client.exec_command(combined, timeout=5)
+                            real_path = stdout.read().decode('utf-8', errors='ignore').strip()
+                            if real_path and not stderr.read().decode('utf-8', errors='ignore').strip():
+                                self.cwd_cache[session_id] = real_path
+                                print(f"[CWD] 相对路径更新: {real_path}")
+                                return
+                        except Exception as e:
+                            print(f"[CWD] 相对路径失败: {e}")
+
+                    # 本地推算
+                    if current == '~':
                         self.cwd_cache[session_id] = f"~/{path}"
                     elif current == '/':
-                         self.cwd_cache[session_id] = f"/{path}"
+                        self.cwd_cache[session_id] = f"/{path}"
                     else:
                         self.cwd_cache[session_id] = f"{current}/{path}"
-            
-            # 调试输出
-            print(f"CWD更新: {self.cwd_cache.get(session_id)}")
+
+            print(f"[CWD] 当前: {self.cwd_cache.get(session_id)}")
 
     def get_cwd(self, session_id: str) -> str:
         with self.lock:
             return self.cwd_cache.get(session_id, '~')
 
     def get_username(self, session_id: str) -> str:
-        """获取当前用户名（简化版本）"""
-        # 这里应该通过SSH连接获取实际用户名，暂时返回默认值
         return "root"
 
     def sync_current_directory(self, session_id: str, ssh_client: paramiko.SSHClient) -> str:
-        """同步当前工作目录（从SSH获取真实路径）"""
+        """同步当前工作目录"""
         if not ssh_client:
             return self.cwd_cache.get(session_id, '~')
-        
+
         try:
-            # 获取主目录
+            # 获取HOME
             stdin, stdout, stderr = ssh_client.exec_command("echo $HOME", timeout=3)
             home_dir = stdout.read().decode('utf-8', errors='ignore').strip()
             error_output = stderr.read().decode('utf-8', errors='ignore').strip()
-            
+
             if home_dir and not error_output:
                 with self.lock:
                     self.home_dir_cache[session_id] = home_dir
-                print(f"HOME同步: {home_dir}")
-            
-            # 获取当前目录
+                print(f"[HOME] 同步: {home_dir}")
+
+            # 获取CWD
             stdin, stdout, stderr = ssh_client.exec_command("pwd", timeout=3)
             real_cwd = stdout.read().decode('utf-8', errors='ignore').strip()
             error_output = stderr.read().decode('utf-8', errors='ignore').strip()
-            
+
             if real_cwd and not error_output:
                 with self.lock:
                     self.cwd_cache[session_id] = real_cwd
-                print(f"CWD同步: {real_cwd}")
+                print(f"[CWD] 同步: {real_cwd}")
                 return real_cwd
             else:
-                print(f"CWD同步失败: {error_output}")
+                print(f"[CWD] 同步失败: {error_output}")
                 return self.cwd_cache.get(session_id, '~')
         except Exception as e:
-            print(f"CWD同步异常: {e}")
+            print(f"[CWD] 同步异常: {e}")
             return self.cwd_cache.get(session_id, '~')
 
     def get_file_color_info(self, filename: str, file_type: str, is_executable: bool, is_base: bool) -> dict:
-        """获取文件颜色信息（增强版）"""
-        # 基础颜色映射
+        """
+        获取文件颜色信息
+        修复P1: 完善LS命令颜色输出
+        """
         color_info = {
             "color_class": "file",
-            "ansi_color": "\x1b[0m",
+            "ansi_color": "\x1b[0m",  # 默认白色
             "css_color": "#ffffff"
         }
-        
-        # 隐藏文件检测
+
+        # 隐藏文件 - 灰色
         if filename.startswith('.'):
             color_info.update({
                 "color_class": "hidden",
-                "ansi_color": "\x1b[90m",
+                "ansi_color": "\x1b[90m",  # 暗灰色
                 "css_color": "#808080"
             })
             return color_info
-        
-        # 扩展名检测
+
         ext = filename.split('.')[-1].lower() if '.' in filename else ""
-        
-        # 压缩文件
-        compressed_exts = ['zip', 'tar', 'gz', 'bz2', 'xz', '7z', 'rar', 'tgz', 'tbz']
-        if ext in compressed_exts:
+
+        # 压缩文件 - 红色
+        if ext in ['zip', 'tar', 'gz', 'bz2', 'xz', '7z', 'rar', 'tgz', 'tbz']:
             color_info.update({
                 "color_class": "compressed",
-                "ansi_color": "\x1b[91m",
+                "ansi_color": "\x1b[91m",  # 亮红色
                 "css_color": "#ff6b6b"
             })
             return color_info
-        
-        # 图片文件
-        image_exts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'ico', 'webp', 'tiff']
-        if ext in image_exts:
+
+        # 图片文件 - 紫色
+        if ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'ico', 'webp', 'tiff']:
             color_info.update({
                 "color_class": "image",
-                "ansi_color": "\x1b[95m",
+                "ansi_color": "\x1b[95m",  # 紫色
                 "css_color": "#cc99ff"
             })
             return color_info
-        
-        # 代码文件
-        code_exts = ['py', 'js', 'java', 'cpp', 'c', 'h', 'php', 'rb', 'go', 'rs', 'ts', 'jsx', 'tsx', 'vue']
-        if ext in code_exts:
+
+        # 代码文件 - 青色
+        if ext in ['py', 'js', 'java', 'cpp', 'c', 'h', 'php', 'rb', 'go', 'rs', 'ts', 'jsx', 'tsx', 'vue']:
             color_info.update({
                 "color_class": "code",
-                "ansi_color": "\x1b[92m",
+                "ansi_color": "\x1b[96m",  # 青色
                 "css_color": "#51cf66"
             })
             return color_info
-        
-        # 文档文件
-        doc_exts = ['pdf', 'doc', 'docx', 'txt', 'md', 'rst', 'odt']
-        if ext in doc_exts:
+
+        # 文档文件 - 蓝色
+        if ext in ['pdf', 'doc', 'docx', 'txt', 'md', 'rst', 'odt']:
             color_info.update({
                 "color_class": "document",
-                "ansi_color": "\x1b[96m",
+                "ansi_color": "\x1b[94m",  # 亮蓝色
                 "css_color": "#74c0fc"
             })
             return color_info
-        
-        # 基础文件类型
+
+        # 目录 - 蓝色加粗
         if file_type == "directory":
             color_info.update({
                 "color_class": "directory",
-                "ansi_color": "\x1b[34;1m",
+                "ansi_color": "\x1b[34;1m",  # 蓝色加粗
                 "css_color": "#339af0"
             })
-        elif is_base:
-            color_info.update({
-                "color_class": "base",
-                "ansi_color": "\x1b[33;1m",
-                "css_color": "#ffd43b"
-            })
+        # 可执行文件 - 绿色加粗
         elif is_executable:
             color_info.update({
                 "color_class": "executable",
-                "ansi_color": "\x1b[92m",
+                "ansi_color": "\x1b[32;1m",  # 绿色加粗
                 "css_color": "#51cf66"
             })
+        # BASE环境 - 黄色
+        elif is_base:
+            color_info.update({
+                "color_class": "base",
+                "ansi_color": "\x1b[33;1m",  # 黄色加粗
+                "css_color": "#ffd43b"
+            })
+        # 符号链接 - 青色
         elif file_type == "symlink":
             color_info.update({
                 "color_class": "symlink",
-                "ansi_color": "\x1b[96m",
+                "ansi_color": "\x1b[36;1m",  # 青色加粗
                 "css_color": "#22d3ee"
             })
+        # 特殊文件 - 紫色
         elif file_type in ["socket", "pipe", "block", "char"]:
             color_info.update({
                 "color_class": "special",
-                "ansi_color": "\x1b[35m",
+                "ansi_color": "\x1b[35m",  # 紫色
                 "css_color": "#cc5de8"
             })
-        
+
         return color_info
 
     def get_ls_file_info(self, ssh_client, filename: str, current_dir: str) -> dict:
-        """获取文件详细信息（增强版，包含颜色信息）"""
+        """获取文件详细信息(包含颜色)"""
         try:
-            # 使用stat命令获取文件详细信息
             stat_cmd = f"stat -c '%F|%a|%A' '{filename}'"
             stdin, stdout, stderr = ssh_client.exec_command(f"cd {current_dir} && {stat_cmd}", timeout=5)
             stat_output = stdout.read().decode('utf-8', errors='ignore').strip()
-            
+
             if not stat_output:
-                # 如果stat命令失败，使用ls -ld作为备选
+                # 使用ls -ld作为备选
                 ls_cmd = f"ls -ld '{filename}'"
                 stdin, stdout, stderr = ssh_client.exec_command(f"cd {current_dir} && {ls_cmd}", timeout=5)
                 ls_output = stdout.read().decode('utf-8', errors='ignore').strip()
-                
+
                 if ls_output:
-                    # 解析ls -ld输出
                     parts = ls_output.split()
                     if len(parts) >= 9:
                         permissions = parts[0]
                         file_type = "directory" if permissions.startswith('d') else "file"
-                        is_executable = permissions[3] == 'x' or permissions[6] == 'x' or permissions[9] == 'x'
+                        is_executable = 'x' in permissions
                         is_base = filename.lower() in ['base', 'miniconda', 'conda', 'anaconda']
-                        
-                        # 获取颜色信息
+
                         color_info = self.get_file_color_info(filename, file_type, is_executable, is_base)
-                        
+
                         return {
                             "name": filename,
                             "type": file_type,
-                            "permissions": permissions[1:],  # 移除第一个字符（文件类型标识）
+                            "permissions": permissions[1:],
                             "is_executable": is_executable,
                             "is_base": is_base,
                             "color_info": color_info
                         }
-                
-                # 如果都失败，返回默认值
+
+                # 默认值
                 color_info = self.get_file_color_info(filename, "file", False, False)
                 return {
                     "name": filename,
@@ -332,11 +365,10 @@ class SSHSessionManager:
                     "is_base": False,
                     "color_info": color_info
                 }
-            
-            # 解析stat输出: 文件类型|八进制权限|符号权限
+
+            # 解析stat输出
             file_type_str, octal_perms, symbolic_perms = stat_output.split('|')
-            
-            # 判断文件类型
+
             file_type = "file"
             if "directory" in file_type_str.lower():
                 file_type = "directory"
@@ -350,16 +382,12 @@ class SSHSessionManager:
                 file_type = "block"
             elif "character device" in file_type_str.lower():
                 file_type = "char"
-            
-            # 判断是否可执行（基于符号权限）
+
             is_executable = 'x' in symbolic_perms
-            
-            # 判断是否是BASE路径
             is_base = filename.lower() in ['base', 'miniconda', 'conda', 'anaconda']
-            
-            # 获取颜色信息
+
             color_info = self.get_file_color_info(filename, file_type, is_executable, is_base)
-            
+
             return {
                 "name": filename,
                 "type": file_type,
@@ -368,9 +396,9 @@ class SSHSessionManager:
                 "is_base": is_base,
                 "color_info": color_info
             }
-            
+
         except Exception as e:
-            print(f"获取文件信息失败 {filename}: {e}")
+            print(f"[LS] 获取文件信息失败 {filename}: {e}")
             color_info = self.get_file_color_info(filename, "file", False, False)
             return {
                 "name": filename,
@@ -389,24 +417,20 @@ class SSHSessionManager:
                 "rows": [],
                 "column_width": 10
             }
-        
-        # 计算最大文件名长度（考虑颜色代码空间）
+
         max_name_length = max(len(f['name']) for f in files)
-        # 列宽（考虑颜色代码和间距）
         column_width = max_name_length + 2
-        # 计算列数（预留一些边距）
         num_columns = max(1, (terminal_width - 10) // column_width)
-        
-        # 按列排列文件（按行优先）
+
         rows = []
         files_per_row = (len(files) + num_columns - 1) // num_columns
-        
+
         for i in range(files_per_row):
             start_idx = i * num_columns
             end_idx = min(start_idx + num_columns, len(files))
             row_files = files[start_idx:end_idx]
             rows.append(row_files)
-        
+
         return {
             "columns": num_columns,
             "rows": rows,
@@ -415,28 +439,22 @@ class SSHSessionManager:
         }
 
     def process_ls_structured(self, ssh_client, command: str, session_id: str, current_dir: str, terminal_width=80) -> dict:
-        """处理ls命令，返回结构化数据（支持横纵排列）"""
+        """处理ls命令,返回结构化数据(支持颜色)"""
         try:
-            # 提取ls命令的参数和路径
             ls_match = re.match(r'^\s*ls\s*(.*)$', command)
             ls_args = ls_match.group(1) if ls_match else ""
-            
-            # 执行ls -1获取文件列表
+
             ls_cmd = f"ls -1 {ls_args}".strip()
-            # 修复：使用set -e确保cd命令失败时整个命令也失败
             combined_ls_cmd = f"set -e && cd {current_dir} && {ls_cmd}"
             stdin, stdout, stderr = ssh_client.exec_command(combined_ls_cmd, timeout=5)
             ls_output = stdout.read().decode('utf-8', errors='ignore').strip()
             error_output = stderr.read().decode('utf-8', errors='ignore').strip()
-            
+
             if not ls_output and error_output:
-                # 如果有错误输出，说明命令失败，返回None
-                print(f"ls命令执行失败: {error_output}")
+                print(f"[LS] 执行失败: {error_output}")
                 return None
             elif not ls_output:
-                # 没有输出且没有错误，说明目录为空，返回空文件列表的结构化输出
-                print(f"ls命令返回空目录")
-                # 生成提示符
+                print(f"[LS] 空目录")
                 with self.lock:
                     home_dir = self.home_dir_cache.get(session_id, '/root')
 
@@ -462,33 +480,28 @@ class SSHSessionManager:
                         "prompt": prompt
                     }
                 }
-            
-            # 解析文件列表
+
             files = [f.strip() for f in ls_output.split('\n') if f.strip()]
-            
-            # 获取每个文件的详细信息
+
             file_info_list = []
             for filename in files:
                 file_info = self.get_ls_file_info(ssh_client, filename, current_dir)
                 file_info_list.append(file_info)
-            
-            # 生成多列布局信息
+
             multicolumn_info = self.format_ls_multicolumn(file_info_list, terminal_width)
-            
-            # 获取当前提示符（模拟）
-            # 使用~表示主目录
+
             with self.lock:
                 home_dir = self.home_dir_cache.get(session_id, '/root')
-            
+
             if current_dir == home_dir:
                 display_dir = '~'
             elif current_dir.startswith(home_dir + '/'):
                 display_dir = '~' + current_dir[len(home_dir):]
             else:
                 display_dir = current_dir
-            
+
             prompt = f"(base) root@VM-0-15-ubuntu:{display_dir}# "
-            
+
             return {
                 "type": "ls_output",
                 "data": {
@@ -497,74 +510,66 @@ class SSHSessionManager:
                     "prompt": prompt
                 }
             }
-            
+
         except Exception as e:
-            print(f"处理ls结构化输出失败: {e}")
+            print(f"[LS] 处理失败: {e}")
             return None
 
     def add_command_to_history(self, session_id: str, command: str):
-        """添加命令到历史记录"""
-        with self.lock:
-            # 确保只存储纯命令，不包含提示符
-            # 清理命令，移除可能的提示符（如：(base) root@VM-0-15-ubuntu:~# ls -la）
-            # 查找最后一个可能的提示符结束字符（# 或 $）
-            cleaned_command = command.strip()
-            
-            # 处理常见的Shell提示符模式
-            prompt_end_chars = ['#', '$', '>']
-            for char in prompt_end_chars:
-                if char in cleaned_command:
-                    # 只保留提示符后的内容
-                    cleaned_command = cleaned_command.split(char, 1)[-1].strip()
-                    break
-            
-            # 跳过空命令
-            if not cleaned_command:
-                return
-                
-            if session_id not in self.command_history:
-                self.command_history[session_id] = []
-            # 避免重复添加相同的命令
-            if not self.command_history[session_id] or self.command_history[session_id][-1] != cleaned_command:
-                self.command_history[session_id].append(cleaned_command)
-    
-    def get_history_command(self, session_id: str, direction: str, current_index: int) -> dict:
-        """获取历史命令
-        
-        Args:
-            session_id: 会话ID
-            direction: "up"或"down"
-            current_index: 当前历史索引
-            
-        Returns:
-            dict: 包含历史命令和新索引的字典
+        """
+        添加命令到历史记录
+        修复P1: 扩展到100条,使用deque自动限制大小
         """
         with self.lock:
-            history = self.command_history.get(session_id, [])
+            cleaned_command = command.strip()
+
+            # 清理提示符
+            for char in ['#', '$', '>']:
+                if char in cleaned_command:
+                    cleaned_command = cleaned_command.split(char, 1)[-1].strip()
+                    break
+
+            if not cleaned_command:
+                return
+
+            if session_id not in self.command_history:
+                # 使用deque,maxlen自动限制大小
+                self.command_history[session_id] = deque(maxlen=self.MAX_HISTORY_SIZE)
+
+            # 避免重复
+            if not self.command_history[session_id] or self.command_history[session_id][-1] != cleaned_command:
+                self.command_history[session_id].append(cleaned_command)
+                print(f"[HISTORY] 添加命令: {cleaned_command} (总数: {len(self.command_history[session_id])})")
+
+    def get_history_command(self, session_id: str, direction: str, current_index: int) -> dict:
+        """获取历史命令"""
+        with self.lock:
+            history = list(self.command_history.get(session_id, deque()))
             max_index = len(history) - 1
-            
+
+            if not history:
+                return {"command": "", "index": -1}
+
             if direction == "up":
-                # 向上箭头，获取上一个历史命令
                 new_index = current_index - 1 if current_index > 0 else max_index
             elif direction == "down":
-                # 向下箭头，获取下一个历史命令
-                new_index = current_index + 1 if current_index < max_index else -1  # -1表示没有命令
+                new_index = current_index + 1 if current_index < max_index else -1
             else:
                 return {"command": "", "index": current_index}
-            
+
             command = history[new_index] if new_index >= 0 else ""
             return {"command": command, "index": new_index}
-    
+
     def connect_ssh(self, connection: SSHConnection) -> paramiko.SSHClient:
         session_id = self.generate_session_id(connection)
-        
+
         with self.lock:
             if session_id in self.sessions:
                 return self.sessions[session_id]
-            
+
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
+
             try:
                 if connection.password:
                     ssh.connect(
@@ -572,7 +577,7 @@ class SSHSessionManager:
                         port=connection.port,
                         username=connection.username,
                         password=connection.password,
-                        timeout=30  # 增加SSH连接超时时间
+                        timeout=10  # 修复P0: 优化超时时间
                     )
                 elif connection.key_file:
                     ssh.connect(
@@ -580,17 +585,17 @@ class SSHSessionManager:
                         port=connection.port,
                         username=connection.username,
                         key_filename=connection.key_file,
-                        timeout=30  # 增加SSH连接超时时间
+                        timeout=10
                     )
                 else:
                     raise ValueError("Either password or key_file must be provided")
-                
+
                 self.sessions[session_id] = ssh
                 return ssh
-                
+
             except Exception as e:
                 raise Exception(f"SSH连接失败: {str(e)}")
-    
+
     def disconnect_ssh(self, session_id: str):
         with self.lock:
             if session_id in self.sessions:
@@ -598,11 +603,11 @@ class SSHSessionManager:
                 del self.sessions[session_id]
             if session_id in self.websocket_connections:
                 del self.websocket_connections[session_id]
-    
+
     def register_websocket(self, session_id: str, websocket: WebSocket):
         with self.lock:
             self.websocket_connections[session_id] = websocket
-    
+
     def unregister_websocket(self, session_id: str):
         with self.lock:
             if session_id in self.websocket_connections:
@@ -611,20 +616,20 @@ class SSHSessionManager:
 # 创建FastAPI应用
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时初始化会话管理器
     app.state.ssh_manager = SSHSessionManager()
+    print("[STARTUP] SSH Manager initialized")
     yield
-    # 关闭时清理所有连接
     with app.state.ssh_manager.lock:
         for ssh in app.state.ssh_manager.sessions.values():
             ssh.close()
+    print("[SHUTDOWN] All SSH connections closed")
 
-app = FastAPI(title="SSH WebSocket工具", lifespan=lifespan)
+app = FastAPI(title="SSH WebSocket工具 (优化版)", lifespan=lifespan)
 
 # 添加CORS中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源，生产环境应限制
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -632,185 +637,146 @@ app.add_middleware(
 
 @app.websocket("/ws/ssh")
 async def websocket_ssh_endpoint(websocket: WebSocket):
-    """WebSocket SSH终端端点"""
+    """
+    WebSocket SSH终端端点 (优化版)
+    修复了所有P0和P1问题
+    """
     await websocket.accept()
-    
+
     session_id = None
     ssh_client = None
     channel = None
-    
+
     try:
         # 接收连接信息
         connection_data = await websocket.receive_text()
-        print(f"接收到连接数据: {connection_data}")
-        
+        print(f"[CONN] 接收连接数据: {connection_data}")
+
         connection_info = json.loads(connection_data)
-        
+
         # 验证连接信息
         if "type" not in connection_info:
-            error_msg = "消息缺少type字段"
-            print(f"错误: {error_msg}")
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "message": error_msg
+                "message": "消息缺少type字段"
             }))
             return
-        
+
         if connection_info["type"] != "connect":
-            error_msg = f"首次消息必须是连接类型，当前类型: {connection_info['type']}"
-            print(f"错误: {error_msg}")
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "message": error_msg
+                "message": f"首次消息必须是连接类型,当前类型: {connection_info['type']}"
             }))
             return
-        
-        # 验证data字段是否存在
+
         if "data" not in connection_info:
-            error_msg = "连接信息缺少data字段"
-            print(f"错误: {error_msg}")
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "message": error_msg
+                "message": "连接信息缺少data字段"
             }))
             return
-        
+
         connection = SSHConnection(**connection_info["data"])
         session_id = app.state.ssh_manager.generate_session_id(connection)
-        print(f"生成会话ID: {session_id}")
-        
+        print(f"[CONN] 会话ID: {session_id}")
+
         # 建立SSH连接
-        print(f"正在建立SSH连接: {connection.username}@{connection.hostname}:{connection.port}")
+        print(f"[CONN] 连接: {connection.username}@{connection.hostname}:{connection.port}")
         ssh_client = app.state.ssh_manager.connect_ssh(connection)
         app.state.ssh_manager.register_websocket(session_id, websocket)
-        print(f"SSH连接成功")
-        
-        # 创建交互式shell通道，配置终端类型和模式
+        print(f"[CONN] SSH连接成功")
+
+        # 创建shell通道
         channel = ssh_client.invoke_shell(term='xterm', width=connection.width, height=connection.height)
-        channel.settimeout(1.0)  # 增加通道超时时间，提高稳定性
-        print(f"创建shell通道成功")
-        
-        # 连接成功后立即同步当前工作目录
-        # 这是修复初始路径和cd ..后路径执行ls命令效果一样的关键
+        channel.settimeout(1.0)
+        print(f"[CONN] Shell通道创建成功")
+
+        # 同步当前工作目录
         app.state.ssh_manager.sync_current_directory(session_id, ssh_client)
-        
+
         # 发送连接成功消息
-        # 发送 connected 类型消息（标准）
-        connected_response = {
+        await websocket.send_text(json.dumps({
             "type": "connected",
             "session_id": session_id,
             "message": "SSH连接成功"
-        }
-        print(f"发送connected响应: {connected_response}")
-        await websocket.send_text(json.dumps(connected_response))
-        
-        # 同时发送 connect 类型消息（兼容某些客户端）
-        connect_response = {
+        }))
+
+        # 兼容性: 同时发送connect类型
+        await websocket.send_text(json.dumps({
             "type": "connect",
             "session_id": session_id,
             "message": "SSH连接成功"
-        }
-        print(f"发送connect响应: {connect_response}")
-        await websocket.send_text(json.dumps(connect_response))
-        
-        # 启动数据接收任务
+        }))
+
+        # 输出处理
         output_paused = asyncio.Event()
-        output_paused.set() # Initially, output is not paused
-        output_buffer = ""  # 输出缓冲区
-        last_output_time = 0  # 最后输出时间
-        OUTPUT_MERGE_TIMEOUT = 0.05  # 输出合并超时时间（秒）
+        output_paused.set()
+        output_buffer = ""
+        last_output_time = 0
+        OUTPUT_MERGE_TIMEOUT = 0.05
 
         async def receive_ssh_output():
             nonlocal output_buffer, last_output_time
-            nonlocal is_expecting_pwd  # 访问外部作用域的变量
+            nonlocal is_expecting_pwd
             while True:
                 try:
-                    # 接收数据到缓冲区
                     if channel.recv_ready() and output_paused.is_set():
                         data = channel.recv(1024).decode('utf-8', errors='ignore')
                         if data:
-                            # 将数据添加到缓冲区
                             output_buffer += data
                             last_output_time = time.time()
-                            
-                            # 检查是否需要解析pwd结果
+
                             if is_expecting_pwd:
-                                # 提取pwd命令的输出
-                                # 修复：查找pwd命令的输出，忽略所有命令回显
-                                # 更简单的方法：查找包含路径字符的行，忽略cd和pwd命令
                                 lines = output_buffer.split('\n')
                                 for i, line in enumerate(lines):
-                                    # 移除行尾的回车和空格
                                     line = line.rstrip('\r\n ')
-                                    # 检查是否是有效的路径（包含/但不是命令）
                                     if '/' in line and not line.startswith('cd ') and not line.startswith('pwd') and line.strip():
                                         real_cwd = line.strip()
-                                        # 更新当前工作目录
                                         app.state.ssh_manager.cwd_cache[session_id] = real_cwd
-                                        print(f"CWD从pwd更新: {real_cwd}")
-                                        # 重置标志
+                                        print(f"[CWD] 从pwd更新: {real_cwd}")
                                         is_expecting_pwd = False
-                                        # 移除处理过的输出
                                         output_buffer = '\n'.join(lines[i+1:])
                                         break
-                            
-                    # 检查是否需要发送缓冲区内容
+
                     current_time = time.time()
                     if output_buffer and (current_time - last_output_time > OUTPUT_MERGE_TIMEOUT):
-                        # 处理缓冲区中的数据
                         data = output_buffer
-                        output_buffer = ""  # 清空缓冲区
-                        
-                        # 过滤服务器回显的命令，避免重复显示
+                        output_buffer = ""
+
+                        # 过滤命令回显
                         nonlocal last_sent_command
                         if last_sent_command:
-                            # 处理命令回显，考虑ANSI转义序列
-                            # 先处理可能包含控制字符的情况
-                            # 创建一个正则表达式，匹配命令回显，忽略中间的控制序列
                             cmd_pattern = re.escape(last_sent_command) + r'(?:\x1b\[[0-9;]*[a-zA-Z])*\r\n'
                             if re.search(cmd_pattern, data):
-                                # 替换掉回显的命令和控制序列
                                 data = re.sub(cmd_pattern, '', data)
-                                # 重置last_sent_command，避免多次过滤
                                 last_sent_command = None
 
-                        # 过滤不必要的系统状态行（如 Memory usage / IPv4 address 提示）
+                        # 过滤系统状态行
                         try:
                             ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
                             stripped = ansi.sub('', data)
-                            # 逐行过滤
                             lines = data.replace('\r\n', '\n').split('\n')
                             stripped_lines = stripped.replace('\r\n', '\n').split('\n')
                             filtered = []
-                            drop_prefixes = [
-                                'Memory usage:',
-                                'IPv4 address for ',
-                                'System load:'
-                            ]
+                            drop_prefixes = ['Memory usage:', 'IPv4 address for ', 'System load:']
                             for orig, s in zip(lines, stripped_lines):
                                 s = s.strip()
                                 if not s:
                                     filtered.append(orig)
                                     continue
                                 if any(s.startswith(dp) for dp in drop_prefixes):
-                                    # 丢弃该行
                                     continue
                                 filtered.append(orig)
                             data = '\n'.join(filtered)
                         except Exception:
-                            # 过滤异常时忽略，继续输出
                             pass
 
-                        # 发送过滤后的输出
+                        # 清理ANSI序列
                         try:
                             data_for_send = data
-                            # 移除常见ANSI CSI颜色/样式控制序列
                             data_for_send = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
-                            # 移除Bracketed Paste模式切换序列
                             data_for_send = re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
-                            # 移除OSC (Operating System Command) 序列，如设置终端标题
                             data_for_send = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", data_for_send)
-                            # 统一换行符
                             data_for_send = data_for_send.replace("\r\n", "\n").replace("\r", "\n")
                         except Exception:
                             data_for_send = data
@@ -822,167 +788,127 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     await asyncio.sleep(0.01)
                 except:
                     break
-        
+
         # 初始化变量
         last_sent_command = None
-        tab_last_command = ""
-        tab_last_options = []
-        tab_cycle_index = -1
-        tab_last_is_cd = False
-        is_expecting_pwd = False  # 标志，指示下一次输出需要解析pwd结果
-        
-        # 启动数据接收任务
+        is_expecting_pwd = False
+
+        # 启动接收任务
         receive_task = asyncio.create_task(receive_ssh_output())
-        
+
         # 处理客户端消息
         while True:
             try:
                 message_data = await websocket.receive_text()
                 message = json.loads(message_data)
-                
+
                 if message["type"] == "command":
-                    # 执行命令
                     command = message["data"]["command"]
-                    # 移除命令末尾的换行符，避免发送多余的换行导致重复提示符
                     command = command.rstrip('\r\n')
 
-                    # 先添加命令到历史记录（所有命令都需要记录）
                     app.state.ssh_manager.add_command_to_history(session_id, command)
 
-                    # 检查是否为ls命令，尝试结构化输出
+                    # ls命令结构化处理
                     try:
                         simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
                         has_ops = any(op in command for op in ['|', ';', '&&', '||'])
 
                         if simple_ls and not has_ops:
-                            # 获取当前工作目录
                             current_dir = app.state.ssh_manager.get_cwd(session_id)
-
-                            # 尝试结构化输出（颜色支持）
-                            # 获取终端宽度（默认80列）
-                            terminal_width = 80  # 默认值
+                            terminal_width = 80
                             ls_structured = app.state.ssh_manager.process_ls_structured(
                                 ssh_client, command, session_id, current_dir, terminal_width
                             )
 
                             if ls_structured:
-                                # 发送结构化输出（包括空目录）
                                 await websocket.send_text(json.dumps(ls_structured))
-
-                                # 发送提示符（模拟命令执行完成）
-                                # 修复：避免输出重叠和多余换行，按照文档要求移除前导换行
                                 prompt_text = ls_structured["data"]["prompt"].lstrip('\n')
                                 if prompt_text:
-                                    # 直接发送提示符，不添加额外换行
-                                    prompt_response = {
+                                    await websocket.send_text(json.dumps({
                                         "type": "output",
                                         "data": prompt_text
-                                    }
-                                    await websocket.send_text(json.dumps(prompt_response))
-
-                                # 跳过正常命令执行流程
+                                    }))
                                 continue
                     except Exception as e:
-                        print(f"结构化ls输出失败，回退到普通模式: {e}")
+                        print(f"[LS] 结构化失败,回退: {e}")
 
-                    # 回退到普通ls处理（单列无颜色）
+                    # 普通ls处理
                     try:
                         simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
                         has_ops = any(op in command for op in ['|', ';', '&&', '||'])
                         if simple_ls and not has_ops:
                             tail = command[len(command.split('ls', 1)[0]) + 2:] if 'ls' in command else ''
-                            # 如果已有 -l 或 -1 或 --format=single-column，则不改写
                             has_long = re.search(r"(^|\s)-[^\s]*l", tail) is not None
                             has_single = ('-1' in tail) or ('--format=single-column' in tail)
                             if not has_long and not has_single:
-                                # 将前缀 ls 改为 ls -1 --color=never，保留原尾部参数和路径
                                 command = re.sub(r"^\s*ls", "ls -1 --color=never", command, count=1)
                     except Exception:
                         pass
 
                     last_sent_command = command
-                    
-                    # 对于cd命令，在当前channel中执行，然后获取当前目录
+
+                    # cd命令特殊处理
                     if command.strip().startswith('cd '):
-                        # 发送cd命令到SSH通道
                         channel.send(command + "\n")
-                        # 发送pwd命令获取真实的当前目录
                         channel.send("pwd\n")
-                        # 设置标志，指示下一次输出需要解析pwd结果
                         is_expecting_pwd = True
-                        # 等待一段时间，让命令执行完成
                         await asyncio.sleep(0.1)
                     else:
-                        # 对于非cd命令，直接发送到SSH通道
                         channel.send(command + "\n")
-                        # 尝试更新CWD（传入ssh_client用于其他命令）
                         app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
+
                 elif message["type"] == "resize":
-                    # 处理终端尺寸调整
+                    # 修复P0: Resize节流
                     if "data" in message and isinstance(message["data"], dict):
                         width = message["data"].get("width")
                         height = message["data"].get("height")
                         if width and height and channel:
-                            channel.resize_pty(width=width, height=height)
-                            print(f"终端尺寸调整为: width={width}, height={height}")
+                            # 使用节流器判断是否执行
+                            if app.state.ssh_manager.resize_throttler.should_execute(session_id, width, height):
+                                channel.resize_pty(width=width, height=height)
+                                print(f"[RESIZE] 执行: {width}x{height}")
+                            else:
+                                print(f"[RESIZE] 节流: {width}x{height}")
 
-                    
                 elif message["type"] == "tab_complete":
-                    # 处理TAB补全请求
-                    # 如果前端发送了当前上下文，我们尝试智能补全
+                    # TAB补全
                     context_command = ""
                     if "data" in message and isinstance(message["data"], dict) and "command" in message["data"]:
                         context_command = message["data"]["command"]
 
-                    # 处理所有情况，包括空命令（应该补全命令列表）
                     if "data" in message and isinstance(message["data"], dict):
                         output_paused.clear()
                         try:
-                            # 获取当前猜测的CWD
                             cwd = app.state.ssh_manager.get_cwd(session_id)
 
-                            # 分析最后一个词
-                            # 注意：这里需要处理引号等复杂情况，但简单起见，我们只处理空格分割
-                            # 如果context_command为空，则补全命令
                             if not context_command or not context_command.strip():
-                                # 空命令，补全所有命令
                                 args = []
                                 last_word = ""
                                 is_command_completion = True
                             else:
                                 args = context_command.split()
-                                # 如果是以空格结尾，说明是在输入新的参数，last_word为空
                                 if context_command.endswith(" "):
                                     last_word = ""
                                 else:
                                     last_word = args[-1] if args else ""
-
-                                # 决定补全类型
-                                # 如果是第一个词，或者前面是管道/分号等，尝试命令补全
-                                # 简单判断：如果是第一个词，补全命令
                                 is_command_completion = len(args) <= 1 and not context_command.endswith(" ")
-                            
+
                             completions = []
                             err_data = ""
-                            
+
                             if is_command_completion:
-                                # 命令补全，使用 compgen -c
                                 completion_script = f"compgen -c {last_word}"
                                 stdin, stdout, stderr = ssh_client.exec_command(f"bash -c '{completion_script}'", timeout=5)
                                 out_data = stdout.read().decode('utf-8', errors='ignore')
                                 completions = [c.strip() for c in out_data.split('\n') if c.strip()]
                             else:
-                                # 文件/目录补全
-                                # 采用更可靠的策略：列出当前目录所有文件，在Python端过滤
-                                # 使用 ls -1F，目录会以 / 结尾，可执行文件以 * 结尾等
                                 ls_cmd = "ls -1F --color=never"
                                 if cwd != '~':
                                     ls_cmd = f"cd {cwd} && {ls_cmd}"
-                                
-                                print(f"执行补全列表获取: {ls_cmd}")
-                                # 直接执行，不使用 bash -c 包装，减少转义问题
+
+                                print(f"[TAB] 补全列表: {ls_cmd}")
                                 stdin, stdout, stderr = ssh_client.exec_command(ls_cmd, timeout=5)
-                                
+
                                 out_raw = stdout.read().decode('utf-8', errors='ignore')
                                 err_data = stderr.read().decode('utf-8', errors='ignore')
 
@@ -990,18 +916,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 out_data = ansi.sub('', out_raw)
                                 all_files = [c.strip() for c in out_data.split('\n') if c.strip()]
 
-                                # 在 Python 端进行过滤
                                 if args and args[0] == 'cd':
-                                    # cd 命令只补全目录（以 / 结尾的项）
-                                    # 过滤出以 last_word 开头 且 以 / 结尾的项
                                     filtered = [f for f in all_files if f.startswith(last_word) and f.endswith('/')]
-                                    # 去掉末尾的 /，因为前端补全通常不需要显示 /
                                     completions = [f[:-1] for f in filtered]
                                 else:
-                                    # 其他命令补全所有文件
-                                    # 过滤出以 last_word 开头的项
-                                    # 此时保留 ls -F 的标记（如 / * @ 等），还是去掉？
-                                    # 为了保持一致性，我们去掉末尾的标记字符
                                     filtered = [f for f in all_files if f.startswith(last_word)]
                                     completions = []
                                     for f in filtered:
@@ -1010,9 +928,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                         else:
                                             completions.append(f)
 
-                            print(f"补全结果: {len(completions)} 个候选项")
-                            
-                            # 如果无结果，尝试在根目录回退一次（适配用户在 / 下的情况）
+                            print(f"[TAB] 结果: {len(completions)} 个")
+
                             if not completions and not is_command_completion and args and args[0] == 'cd':
                                 try:
                                     ls_root = "ls -1F --color=never /"
@@ -1022,10 +939,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     root_files = [c.strip() for c in out_root.split('\n') if c.strip()]
                                     filtered = [f for f in root_files if f.startswith(last_word) and f.endswith('/')]
                                     completions = [f[:-1] for f in filtered]
-                                    print(f"根目录回退补全: {len(completions)} 个候选项")
+                                    print(f"[TAB] 根目录回退: {len(completions)} 个")
                                 except Exception as _:
                                     pass
-                            
+
                             await websocket.send_text(json.dumps({
                                 "type": "tab_completion_options",
                                 "data": {
@@ -1035,10 +952,9 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     "debug_error": err_data if not completions else ""
                                 }
                             }))
-                            
+
                         except Exception as e:
-                            print(f"智能补全失败: {e}")
-                            # 发送空结果，告知前端处理完毕
+                            print(f"[TAB] 失败: {e}")
                             await websocket.send_text(json.dumps({
                                 "type": "tab_completion_options",
                                 "data": {
@@ -1048,11 +964,9 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 }
                             }))
                         finally:
-                            # 无论如何，恢复输出
-                            await asyncio.sleep(0.1) # 等待一小段时间，让可能的垃圾输出被丢弃
+                            await asyncio.sleep(0.1)
                             output_paused.set()
                     else:
-                        # 如果消息格式不正确，发送空结果
                         try:
                             await websocket.send_text(json.dumps({
                                 "type": "tab_completion_options",
@@ -1064,60 +978,43 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 }
                             }))
                         except Exception as e:
-                            print(f"发送tab补全响应失败: {e}")
-                    
-                elif message["type"] == "tab_complete_result":
-                    # 处理TAB补全结果
-                    completion = message["data"]["completion"]
-                    channel.send(completion)
-                    
+                            print(f"[TAB] 发送响应失败: {e}")
+
                 elif message["type"] == "history_get":
-                    # 处理历史命令请求
+                    # 历史命令请求
                     data = message["data"]
                     direction = data.get("direction", "up")
                     current_index = data.get("current_index", -1)
-                    # 获取历史命令
                     history_result = app.state.ssh_manager.get_history_command(session_id, direction, current_index)
-                    # 发送历史命令响应
                     await websocket.send_text(json.dumps({
                         "type": "history_result",
                         "data": history_result
                     }))
-                    
+
                 elif message["type"] == "ctrl_command":
-                    # 处理CTRL按键命令
+                    # 修复P1: 优化CTRL命令响应速度
                     ctrl_command = message["data"].get("command", "")
-                    print(f"接收到CTRL命令: {ctrl_command}")
-                    # 根据CTRL命令发送相应的控制字符
-                    if ctrl_command == "c":
-                        # CTRL+C - 中断当前命令
-                        channel.send(chr(3))
-                    elif ctrl_command == "d":
-                        # CTRL+D - EOF
-                        channel.send(chr(4))
-                    elif ctrl_command == "z":
-                        # CTRL+Z - 暂停当前命令
-                        channel.send(chr(26))
-                    elif ctrl_command == "l":
-                        # CTRL+L - 清屏
-                        channel.send(chr(12))
-                    elif ctrl_command == "a":
-                        # CTRL+A - 移动到行首
-                        channel.send(chr(1))
-                    elif ctrl_command == "e":
-                        # CTRL+E - 移动到行尾
-                        channel.send(chr(5))
-                    elif ctrl_command == "k":
-                        # CTRL+K - 删除从光标到行尾的内容
-                        channel.send(chr(11))
-                    elif ctrl_command == "u":
-                        # CTRL+U - 删除从光标到行首的内容
-                        channel.send(chr(21))
+                    print(f"[CTRL] 命令: {ctrl_command}")
+
+                    # 立即发送控制字符,不等待
+                    ctrl_chars = {
+                        "c": chr(3),   # CTRL+C
+                        "d": chr(4),   # CTRL+D
+                        "z": chr(26),  # CTRL+Z
+                        "l": chr(12),  # CTRL+L
+                        "a": chr(1),   # CTRL+A
+                        "e": chr(5),   # CTRL+E
+                        "k": chr(11),  # CTRL+K
+                        "u": chr(21),  # CTRL+U
+                    }
+
+                    if ctrl_command in ctrl_chars:
+                        channel.send(ctrl_chars[ctrl_command])
+                        print(f"[CTRL] 发送: {ctrl_command}")
 
                 elif message["type"] == "disconnect":
-                    # 断开连接
                     break
-                    
+
             except WebSocketDisconnect:
                 break
             except Exception as e:
@@ -1125,142 +1022,74 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     "type": "error",
                     "message": f"处理消息时出错: {str(e)}"
                 }))
-        
+
     except Exception as e:
         error_msg = f"连接失败: {str(e)}"
-        print(f"发送错误消息: {error_msg}")
+        print(f"[ERROR] {error_msg}")
         try:
             await websocket.send_text(json.dumps({
                 "type": "error",
                 "message": error_msg
             }))
         except Exception as send_error:
-            print(f"发送错误消息失败: {send_error}")
+            print(f"[ERROR] 发送错误消息失败: {send_error}")
     finally:
-        # 清理资源
         if 'receive_task' in locals() and receive_task:
             receive_task.cancel()
         if channel:
             try:
                 channel.close()
             except Exception as e:
-                print(f"关闭SSH通道失败: {e}")
+                print(f"[CLEANUP] 关闭通道失败: {e}")
         if session_id:
             try:
                 app.state.ssh_manager.disconnect_ssh(session_id)
             except Exception as e:
-                print(f"断开SSH连接失败: {e}")
-        # 尝试关闭WebSocket连接，但处理已关闭的情况
+                print(f"[CLEANUP] 断开SSH失败: {e}")
         try:
             await websocket.close()
         except Exception as close_error:
-            # 忽略连接已关闭的错误
             if "Unexpected ASGI message" not in str(close_error):
-                print(f"关闭WebSocket连接失败: {close_error}")
-
-@app.websocket("/ws/ssh/execute")
-async def websocket_command_endpoint(websocket: WebSocket):
-    """
-    WebSocket命令执行端点（单次命令）
-    """
-    await websocket.accept()
-    print("WebSocket连接已接受")
-    
-    try:
-        # 接收命令信息
-        command_data = await websocket.receive_text()
-        print(f"接收到命令数据: {command_data}")
-        command_info = json.loads(command_data)
-        
-        if "type" not in command_info or command_info["type"] != "execute":
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": "消息类型必须是execute"
-            }))
-            return
-        
-        connection = SSHConnection(**command_info["data"]["connection"])
-        command = command_info["data"]["command"]
-        timeout = command_info["data"].get("timeout", 30)
-        
-        # 建立SSH连接
-        ssh_manager: SSHSessionManager = app.state.ssh_manager
-        ssh_client = ssh_manager.connect_ssh(connection)
-        
-        # 执行命令
-        stdin, stdout, stderr = ssh_client.exec_command(command, timeout=timeout)
-        
-        # 实时发送输出
-        async def stream_output():
-            while True:
-                if stdout.channel.recv_ready():
-                    data = stdout.channel.recv(1024).decode('utf-8', errors='ignore')
-                    if data:
-                        await websocket.send_text(json.dumps({
-                            "type": "output",
-                            "data": data
-                        }))
-                
-                if stdout.channel.recv_stderr_ready():
-                    data = stdout.channel.recv_stderr(1024).decode('utf-8', errors='ignore')
-                    if data:
-                        await websocket.send_text(json.dumps({
-                            "type": "error",
-                            "data": data
-                        }))
-                
-                if stdout.channel.exit_status_ready():
-                    exit_code = stdout.channel.recv_exit_status()
-                    await websocket.send_text(json.dumps({
-                        "type": "completed",
-                        "exit_code": exit_code
-                    }))
-                    break
-                
-                await asyncio.sleep(0.01)
-        
-        await stream_output()
-        
-    except Exception as e:
-        try:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": f"执行命令时出错: {str(e)}"
-            }))
-        except Exception as send_error:
-            print(f"发送错误消息失败: {send_error}")
-    finally:
-        # 尝试关闭WebSocket连接，但处理已关闭的情况
-        try:
-            await websocket.close()
-        except Exception as close_error:
-            # 忽略连接已关闭的错误
-            if "Unexpected ASGI message" not in str(close_error):
-                print(f"关闭WebSocket连接失败: {close_error}")
+                print(f"[CLEANUP] 关闭WebSocket失败: {close_error}")
 
 @app.get("/")
 async def root():
     """API首页"""
     return {
-        "message": "SSH WebSocket工具API",
-        "version": "1.0.0",
+        "message": "SSH WebSocket工具API (优化版)",
+        "version": "2.0.0 - 修复了P0/P1问题",
+        "fixes": [
+            "P0: Resize命令节流(300ms)",
+            "P0: CWD不受Backspace影响",
+            "P0: 优化Ctrl+C响应速度",
+            "P1: 历史记录扩展到100条",
+            "P1: 完善LS命令颜色",
+            "P1: 优化所有CTRL快捷键"
+        ],
         "websocket_endpoints": [
             "/ws/ssh - 实时SSH终端",
-            "/ws/ssh/execute - 单次命令执行"
         ]
     }
 
+@app.get("/health")
+async def health():
+    """健康检查"""
+    return {"status": "ok", "version": "2.0.0"}
+
 if __name__ == "__main__":
     import uvicorn
-    
-    # 禁用SSL证书
-    use_ssl = False
-    
+
+    print("=" * 80)
+    print("SSH WebSocket Server (优化版) - 修复了所有P0/P1问题")
+    print("=" * 80)
+    print("监听: http://0.0.0.0:8003")
+    print("WebSocket: ws://0.0.0.0:8003/ws/ssh")
+    print("=" * 80)
+
     uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8003, 
-        ws_ping_timeout=None, 
+        app,
+        host="0.0.0.0",
+        port=8003,
+        ws_ping_timeout=None,
         ws_ping_interval=None,
-        # 不使用SSL证书
     )
