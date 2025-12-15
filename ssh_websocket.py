@@ -737,21 +737,11 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                         print(f"[CWD] 从pwd更新: {real_cwd}")
                                         is_expecting_pwd = False
 
-                                        # 修复：cd命令后发送新的提示符
-                                        home_dir = app.state.ssh_manager.home_dir_cache.get(session_id, '/root')
-                                        if real_cwd == home_dir:
-                                            display_dir = '~'
-                                        elif real_cwd.startswith(home_dir + '/'):
-                                            display_dir = '~' + real_cwd[len(home_dir):]
-                                        else:
-                                            display_dir = real_cwd
+                                        # 修复：移除手动发送提示符，让 SSH 通道自然输出
+                                        # 只保留目录更新逻辑，不再手动构造和发送提示符
+                                        # 这样可以避免提示符重复问题
 
-                                        new_prompt = f"(base) root@VM-0-15-ubuntu:{display_dir}# "
-                                        await websocket.send_text(json.dumps({
-                                            "type": "output",
-                                            "data": new_prompt
-                                        }))
-
+                                        # 清空 pwd 命令的输出行，保留后续的提示符
                                         output_buffer = '\n'.join(lines[i+1:])
                                         break
 
@@ -826,6 +816,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     app.state.ssh_manager.add_command_to_history(session_id, command)
 
                     # ls命令结构化处理
+                    # 修复：确保所有 ls 命令都返回 ls_output 类型，即使处理失败也返回空结果
                     try:
                         simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
                         has_ops = any(op in command for op in ['|', ';', '&&', '||'])
@@ -839,12 +830,68 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
                             if ls_structured:
                                 await websocket.send_text(json.dumps(ls_structured))
-                                # 修复：不再额外发送提示符，SSH通道会自动输出
+                                continue
+                            else:
+                                # 修复：如果结构化处理返回 None，仍然返回空的 ls_output
+                                home_dir = app.state.ssh_manager.home_dir_cache.get(session_id, '/root')
+                                if current_dir == home_dir:
+                                    display_dir = '~'
+                                elif current_dir.startswith(home_dir + '/'):
+                                    display_dir = '~' + current_dir[len(home_dir):]
+                                else:
+                                    display_dir = current_dir
+
+                                prompt = f"(base) root@VM-0-15-ubuntu:{display_dir}# "
+                                await websocket.send_text(json.dumps({
+                                    "type": "ls_output",
+                                    "data": {
+                                        "files": [],
+                                        "layout": {
+                                            "columns": 1,
+                                            "rows": [],
+                                            "column_width": 10,
+                                            "total_files": 0
+                                        },
+                                        "prompt": prompt
+                                    }
+                                }))
                                 continue
                     except Exception as e:
-                        print(f"[LS] 结构化失败,回退: {e}")
+                        print(f"[LS] 结构化失败: {e}")
+                        # 修复：即使出现异常，也返回 ls_output 类型的空结果，而不是回退到普通处理
+                        try:
+                            simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
+                            has_ops = any(op in command for op in ['|', ';', '&&', '||'])
+                            if simple_ls and not has_ops:
+                                current_dir = app.state.ssh_manager.get_cwd(session_id)
+                                home_dir = app.state.ssh_manager.home_dir_cache.get(session_id, '/root')
+                                if current_dir == home_dir:
+                                    display_dir = '~'
+                                elif current_dir.startswith(home_dir + '/'):
+                                    display_dir = '~' + current_dir[len(home_dir):]
+                                else:
+                                    display_dir = current_dir
 
-                    # 普通ls处理
+                                prompt = f"(base) root@VM-0-15-ubuntu:{display_dir}# "
+                                await websocket.send_text(json.dumps({
+                                    "type": "ls_output",
+                                    "data": {
+                                        "files": [],
+                                        "layout": {
+                                            "columns": 1,
+                                            "rows": [],
+                                            "column_width": 10,
+                                            "total_files": 0
+                                        },
+                                        "prompt": prompt,
+                                        "error": str(e)
+                                    }
+                                }))
+                                continue
+                        except:
+                            pass
+
+                    # 普通ls处理（仅在非简单ls命令时执行，如 ls -la | grep xxx）
                     try:
                         simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
                         has_ops = any(op in command for op in ['|', ';', '&&', '||'])
