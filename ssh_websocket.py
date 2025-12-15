@@ -735,6 +735,22 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                         app.state.ssh_manager.cwd_cache[session_id] = real_cwd
                                         print(f"[CWD] 从pwd更新: {real_cwd}")
                                         is_expecting_pwd = False
+
+                                        # 修复：cd命令后发送新的提示符
+                                        home_dir = app.state.ssh_manager.home_dir_cache.get(session_id, '/root')
+                                        if real_cwd == home_dir:
+                                            display_dir = '~'
+                                        elif real_cwd.startswith(home_dir + '/'):
+                                            display_dir = '~' + real_cwd[len(home_dir):]
+                                        else:
+                                            display_dir = real_cwd
+
+                                        new_prompt = f"(base) root@VM-0-15-ubuntu:{display_dir}# "
+                                        await websocket.send_text(json.dumps({
+                                            "type": "output",
+                                            "data": new_prompt
+                                        }))
+
                                         output_buffer = '\n'.join(lines[i+1:])
                                         break
 
@@ -822,12 +838,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
                             if ls_structured:
                                 await websocket.send_text(json.dumps(ls_structured))
-                                prompt_text = ls_structured["data"]["prompt"].lstrip('\n')
-                                if prompt_text:
-                                    await websocket.send_text(json.dumps({
-                                        "type": "output",
-                                        "data": prompt_text
-                                    }))
+                                # 修复：不再额外发送提示符，SSH通道会自动输出
                                 continue
                     except Exception as e:
                         print(f"[LS] 结构化失败,回退: {e}")
@@ -858,15 +869,25 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
 
                 elif message["type"] == "resize":
-                    # 修复P0: Resize节流
+                    # 修复P0: Resize节流 + 修复：resize时暂停输出并清空缓冲区
                     if "data" in message and isinstance(message["data"], dict):
                         width = message["data"].get("width")
                         height = message["data"].get("height")
                         if width and height and channel:
                             # 使用节流器判断是否执行
                             if app.state.ssh_manager.resize_throttler.should_execute(session_id, width, height):
-                                channel.resize_pty(width=width, height=height)
-                                print(f"[RESIZE] 执行: {width}x{height}")
+                                # 暂停输出接收
+                                output_paused.clear()
+                                try:
+                                    channel.resize_pty(width=width, height=height)
+                                    print(f"[RESIZE] 执行: {width}x{height}")
+                                    # 等待并清空resize触发的任何输出
+                                    await asyncio.sleep(0.05)
+                                    while channel.recv_ready():
+                                        channel.recv(4096)  # 丢弃resize触发的输出
+                                finally:
+                                    # 恢复输出接收
+                                    output_paused.set()
                             else:
                                 print(f"[RESIZE] 节流: {width}x{height}")
 
