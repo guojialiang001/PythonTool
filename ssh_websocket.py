@@ -880,11 +880,13 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 
                     
                 elif message["type"] == "tab_complete":
+                    print(f"DEBUG: Received tab_complete message: {message}")
                     # 处理TAB补全请求
                     # 如果前端发送了当前上下文，我们尝试智能补全
                     context_command = ""
                     if "data" in message and isinstance(message["data"], dict) and "command" in message["data"]:
                         context_command = message["data"]["command"]
+                        print(f"DEBUG: context_command: '{context_command}'")
 
                     # 处理所有情况，包括空命令（应该补全命令列表）
                     if "data" in message and isinstance(message["data"], dict):
@@ -892,6 +894,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         try:
                             # 获取当前猜测的CWD
                             cwd = app.state.ssh_manager.get_cwd(session_id)
+                            print(f"DEBUG: Current CWD: {cwd}")
 
                             # 分析最后一个词
                             # 注意：这里需要处理引号等复杂情况，但简单起见，我们只处理空格分割
@@ -901,18 +904,23 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 args = []
                                 last_word = ""
                                 is_command_completion = True
+                                print("DEBUG: Empty command, using command completion")
                             else:
                                 args = context_command.split()
+                                print(f"DEBUG: args: {args}")
                                 # 如果是以空格结尾，说明是在输入新的参数，last_word为空
                                 if context_command.endswith(" "):
                                     last_word = ""
                                 else:
                                     last_word = args[-1] if args else ""
+                                
+                                print(f"DEBUG: last_word: '{last_word}'")
 
                                 # 决定补全类型
                                 # 如果是第一个词，或者前面是管道/分号等，尝试命令补全
                                 # 简单判断：如果是第一个词，补全命令
                                 is_command_completion = len(args) <= 1 and not context_command.endswith(" ")
+                                print(f"DEBUG: is_command_completion: {is_command_completion}")
                             
                             completions = []
                             err_data = ""
@@ -920,9 +928,11 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             if is_command_completion:
                                 # 命令补全，使用 compgen -c
                                 completion_script = f"compgen -c {last_word}"
+                                print(f"DEBUG: Executing command completion script: {completion_script}")
                                 stdin, stdout, stderr = ssh_client.exec_command(f"bash -c '{completion_script}'", timeout=5)
                                 out_data = stdout.read().decode('utf-8', errors='ignore')
                                 completions = [c.strip() for c in out_data.split('\n') if c.strip()]
+                                print(f"DEBUG: Command completions found: {len(completions)}")
                             else:
                                 # 文件/目录补全
                                 # 采用更可靠的策略：列出当前目录所有文件，在Python端过滤
@@ -937,10 +947,12 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 
                                 out_raw = stdout.read().decode('utf-8', errors='ignore')
                                 err_data = stderr.read().decode('utf-8', errors='ignore')
+                                print(f"DEBUG: ls stderr: {err_data}")
 
                                 ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
                                 out_data = ansi.sub('', out_raw)
                                 all_files = [c.strip() for c in out_data.split('\n') if c.strip()]
+                                print(f"DEBUG: Total files found: {len(all_files)}")
 
                                 # 在 Python 端进行过滤
                                 if args and args[0] == 'cd':
@@ -949,6 +961,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     filtered = [f for f in all_files if f.startswith(last_word) and f.endswith('/')]
                                     # 去掉末尾的 /，因为前端补全通常不需要显示 /
                                     completions = [f[:-1] for f in filtered]
+                                    print(f"DEBUG: cd completions found: {len(completions)}")
                                 else:
                                     # 其他命令补全所有文件
                                     # 过滤出以 last_word 开头的项
@@ -961,12 +974,15 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                             completions.append(f[:-1])
                                         else:
                                             completions.append(f)
+                                    print(f"DEBUG: File completions found: {len(completions)}")
 
                             print(f"补全结果: {len(completions)} 个候选项")
+                            print(f"DEBUG: Completions list (first 10): {completions[:10]}")
                             
                             # 如果无结果，尝试在根目录回退一次（适配用户在 / 下的情况）
                             if not completions and not is_command_completion and args and args[0] == 'cd':
                                 try:
+                                    print("DEBUG: Attempting root fallback for cd")
                                     ls_root = "ls -1F --color=never /"
                                     stdin, stdout, stderr = ssh_client.exec_command(ls_root, timeout=5)
                                     out_root_raw = stdout.read().decode('utf-8', errors='ignore')
@@ -975,10 +991,12 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     filtered = [f for f in root_files if f.startswith(last_word) and f.endswith('/')]
                                     completions = [f[:-1] for f in filtered]
                                     print(f"根目录回退补全: {len(completions)} 个候选项")
-                                except Exception as _:
+                                    print(f"DEBUG: Root fallback completions: {completions}")
+                                except Exception as e_root:
+                                    print(f"DEBUG: Root fallback error: {e_root}")
                                     pass
                             
-                            await websocket.send_text(json.dumps({
+                            response_data = {
                                 "type": "tab_completion_options",
                                 "data": {
                                     "options": completions,
@@ -986,10 +1004,14 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     "path_prefix": cwd if not is_command_completion else "",
                                     "debug_error": err_data if not completions else ""
                                 }
-                            }))
+                            }
+                            print(f"DEBUG: Sending response: {json.dumps(response_data)[:200]}...")
+                            await websocket.send_text(json.dumps(response_data))
                             
                         except Exception as e:
                             print(f"智能补全失败: {e}")
+                            import traceback
+                            traceback.print_exc()
                             # 发送空结果，告知前端处理完毕
                             await websocket.send_text(json.dumps({
                                 "type": "tab_completion_options",
