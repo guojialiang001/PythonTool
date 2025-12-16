@@ -730,7 +730,8 @@ class SSHSessionManager:
                             "column_width": 10,
                             "total_files": 0
                         },
-                        "prompt": prompt
+                        "prompt": prompt,
+                        "currentPath": current_dir
                     }
                 }
 
@@ -761,7 +762,8 @@ class SSHSessionManager:
                 "data": {
                     "files": file_info_list,
                     "layout": multicolumn_info,
-                    "prompt": prompt
+                    "prompt": prompt,
+                    "currentPath": current_dir
                 }
             }
 
@@ -1027,9 +1029,14 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         except Exception:
                             data_for_send = data
 
+                        # 获取当前真实路径
+                        current_path = app.state.ssh_manager.get_cwd(session_id)
                         await websocket.send_text(json.dumps({
                             "type": "output",
-                            "data": data_for_send
+                            "data": {
+                                "output": data_for_send,
+                                "currentPath": current_path
+                            }
                         }))
                     await asyncio.sleep(0.01)
                 except:
@@ -1105,7 +1112,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                             "column_width": 10,
                                             "total_files": 0
                                         },
-                                        "prompt": prompt
+                                        "prompt": prompt,
+                                        "currentPath": current_dir
                                     }
                                 }))
                                 continue
@@ -1138,7 +1146,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                             "total_files": 0
                                         },
                                         "prompt": prompt,
-                                        "error": str(e)
+                                        "error": str(e),
+                                        "currentPath": current_dir
                                     }
                                 }))
                                 continue
@@ -1163,12 +1172,13 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     # cd命令特殊处理
                     # 修复：不要通过 channel.send pwd，会干扰用户输入（Tab/Ctrl）
                     # 改为通过 exec_command 在后台获取 pwd，不影响用户操作
-                    if command.strip().startswith('cd '):
+                    if command.strip().startswith('cd ') or command.strip() == 'cd':
                         channel.send(command + "\n")
                         # 不再发送 pwd 到channel，改为后台执行
                         # channel.send("pwd\n")  # 删除：这会干扰用户输入
 
                         # 后台获取当前目录，不干扰用户输入
+                        real_cwd = None
                         try:
                             # 提取 cd 的目标路径
                             cd_parts = command.strip().split(maxsplit=1)
@@ -1189,6 +1199,16 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             print(f"[CWD] 后台更新失败: {e}")
                             # 失败时使用本地逻辑更新
                             app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
+                            real_cwd = app.state.ssh_manager.get_cwd(session_id)
+
+                        # 发送 cd_result 响应，包含新的 currentPath
+                        if real_cwd:
+                            await websocket.send_text(json.dumps({
+                                "type": "cd_result",
+                                "data": {
+                                    "currentPath": real_cwd
+                                }
+                            }))
                     else:
                         channel.send(command + "\n")
                         app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
