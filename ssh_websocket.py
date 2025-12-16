@@ -191,6 +191,96 @@ class SSHSessionManager:
         with self.lock:
             return self.cwd_cache.get(session_id, '~')
 
+    def sync_cwd_from_frontend(self, session_id: str, frontend_path: str, ssh_client: paramiko.SSHClient = None, skip_validation: bool = False) -> str:
+        """
+        从前端同步当前工作目录
+        处理前端发送的 currentPath 参数，确保前后端路径一致
+
+        Args:
+            session_id: 会话ID
+            frontend_path: 前端发送的当前路径
+            ssh_client: SSH客户端（可选，用于验证路径）
+            skip_validation: 是否跳过 SSH 验证（用于 cd 命令，避免重复验证）
+
+        Returns:
+            str: 同步后的有效路径
+        """
+        if not frontend_path:
+            return self.get_cwd(session_id)
+
+        # 规范化前端路径
+        frontend_path = frontend_path.strip()
+        if not frontend_path:
+            return self.get_cwd(session_id)
+
+        # 获取后端缓存的路径
+        backend_path = self.get_cwd(session_id)
+
+        # 如果路径一致，直接返回
+        if frontend_path == backend_path:
+            return backend_path
+
+        # 处理 ~ 路径
+        if frontend_path == '~':
+            with self.lock:
+                home_dir = self.home_dir_cache.get(session_id)
+            if home_dir:
+                frontend_path = home_dir
+            else:
+                # 没有缓存的 home 目录，返回后端路径
+                return backend_path
+
+        # 安全检查：转义危险字符，防止命令注入
+        def escape_path(path: str) -> str:
+            """转义路径中的危险字符"""
+            # 替换单引号为 '\''
+            return path.replace("'", "'\"'\"'")
+
+        # 如果跳过验证，直接信任绝对路径
+        if skip_validation and frontend_path.startswith('/'):
+            with self.lock:
+                self.cwd_cache[session_id] = frontend_path
+            return frontend_path
+
+        # 如果有 SSH 客户端且需要验证，验证前端路径是否有效
+        if ssh_client and frontend_path.startswith('/'):
+            try:
+                # 验证路径是否存在（使用转义后的路径）
+                safe_path = escape_path(frontend_path)
+                check_cmd = f"cd '{safe_path}' 2>/dev/null && pwd"
+                stdin, stdout, stderr = ssh_client.exec_command(check_cmd, timeout=2)
+                real_path = stdout.read().decode('utf-8', errors='ignore').strip()
+                error = stderr.read().decode('utf-8', errors='ignore').strip()
+
+                if real_path and not error and real_path.startswith('/'):
+                    # 前端路径有效，更新后端缓存
+                    with self.lock:
+                        self.cwd_cache[session_id] = real_path
+                    print(f"[CWD-SYNC] 前端路径有效，更新缓存: {real_path}")
+                    return real_path
+                else:
+                    # 前端路径无效，使用后端路径
+                    print(f"[CWD-SYNC] 前端路径无效({frontend_path})，使用后端路径: {backend_path}")
+                    return backend_path
+            except Exception as e:
+                print(f"[CWD-SYNC] 验证失败: {e}")
+                # 验证失败时，如果前端路径看起来像有效路径，信任它
+                if frontend_path.startswith('/'):
+                    with self.lock:
+                        self.cwd_cache[session_id] = frontend_path
+                    return frontend_path
+                return backend_path
+
+        # 如果是绝对路径但没有SSH客户端，信任前端
+        if frontend_path.startswith('/'):
+            with self.lock:
+                self.cwd_cache[session_id] = frontend_path
+            print(f"[CWD-SYNC] 信任前端绝对路径: {frontend_path}")
+            return frontend_path
+
+        # 其他情况使用后端路径
+        return backend_path
+
     def get_username(self, session_id: str) -> str:
         return "root"
 
@@ -802,6 +892,17 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     command = message["data"]["command"]
                     command = command.rstrip('\r\n')
 
+                    # 处理前端发送的 currentPath 参数
+                    # 对于 cd 命令，跳过 SSH 验证（cd 命令会自己更新路径，避免重复验证）
+                    frontend_path = message["data"].get("currentPath", "")
+                    is_cd_command = command.strip().startswith('cd ') or command.strip() == 'cd'
+                    if frontend_path:
+                        synced_cwd = app.state.ssh_manager.sync_cwd_from_frontend(
+                            session_id, frontend_path, ssh_client,
+                            skip_validation=is_cd_command  # cd 命令跳过验证
+                        )
+                        print(f"[CMD] 前端路径: {frontend_path}, 同步后: {synced_cwd}, cd命令: {is_cd_command}")
+
                     app.state.ssh_manager.add_command_to_history(session_id, command)
 
                     # ls命令结构化处理
@@ -961,7 +1062,15 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     if "data" in message and isinstance(message["data"], dict):
                         output_paused.clear()
                         try:
-                            cwd = app.state.ssh_manager.get_cwd(session_id)
+                            # 处理前端发送的 currentPath 参数
+                            frontend_path = message["data"].get("currentPath", "")
+                            if frontend_path:
+                                cwd = app.state.ssh_manager.sync_cwd_from_frontend(
+                                    session_id, frontend_path, ssh_client
+                                )
+                                print(f"[TAB] 前端路径: {frontend_path}, 同步后: {cwd}")
+                            else:
+                                cwd = app.state.ssh_manager.get_cwd(session_id)
 
                             if not context_command or not context_command.strip():
                                 args = []
