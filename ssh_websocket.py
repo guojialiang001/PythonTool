@@ -191,10 +191,193 @@ class SSHSessionManager:
         with self.lock:
             return self.cwd_cache.get(session_id, '~')
 
+    @staticmethod
+    def escape_shell_path(path: str) -> str:
+        """
+        转义路径中的危险字符，防止命令注入
+        纯函数，不依赖任何状态
+
+        Args:
+            path: 原始路径字符串
+
+        Returns:
+            str: 转义后的安全路径
+        """
+        if not path:
+            return path
+        # 替换单引号为 '\''，这是shell中转义单引号的标准方式
+        return path.replace("'", "'\"'\"'")
+
+    @staticmethod
+    def validate_path_format(path: str) -> tuple:
+        """
+        验证路径格式是否有效（纯函数，不依赖状态）
+
+        Args:
+            path: 要验证的路径
+
+        Returns:
+            tuple: (is_valid: bool, error_message: str, normalized_path: str)
+        """
+        # 空路径
+        if path is None:
+            return (False, "路径为None", "")
+
+        if not isinstance(path, str):
+            return (False, f"路径类型错误: {type(path).__name__}", "")
+
+        # 去除首尾空白
+        normalized = path.strip()
+
+        if not normalized:
+            return (False, "路径为空字符串", "")
+
+        # 路径长度限制 (Linux PATH_MAX = 4096)
+        if len(normalized) > 4096:
+            return (False, f"路径过长: {len(normalized)} > 4096", "")
+
+        # 检查空字节（安全漏洞）
+        if '\x00' in normalized:
+            return (False, "路径包含空字节", "")
+
+        # 检查危险的控制字符
+        control_chars = ['\x01', '\x02', '\x03', '\x04', '\x05', '\x06', '\x07',
+                         '\x08', '\x0b', '\x0c', '\x0e', '\x0f', '\x10', '\x11',
+                         '\x12', '\x13', '\x14', '\x15', '\x16', '\x17', '\x18',
+                         '\x19', '\x1a', '\x1b', '\x1c', '\x1d', '\x1e', '\x1f']
+        for c in control_chars:
+            if c in normalized:
+                return (False, f"路径包含控制字符: {repr(c)}", "")
+
+        # 检查命令注入字符（除了路径分隔符和~以外的shell元字符）
+        # 注意：单引号和反斜杠可以出现在文件名中，但需要转义
+        dangerous_patterns = ['$(', '`', '${', '||', '&&', ';', '\n', '\r']
+        for pattern in dangerous_patterns:
+            if pattern in normalized:
+                return (False, f"路径包含危险字符: {repr(pattern)}", "")
+
+        return (True, "", normalized)
+
+    def resolve_frontend_path(self, frontend_path: str, ssh_client: paramiko.SSHClient = None,
+                              default_path: str = None) -> tuple:
+        """
+        解析前端传来的路径（纯函数逻辑，不使用缓存存储）
+
+        设计原则：
+        1. 后端不存储路径，不做缓存
+        2. 每次调用都基于输入参数独立解析
+        3. 优先使用前端传来的路径
+        4. SSH验证仅用于获取真实路径，不用于持久化
+
+        Args:
+            frontend_path: 前端发送的当前路径
+            ssh_client: SSH客户端（可选，用于解析 ~ 和验证路径）
+            default_path: 默认路径（当前端路径无效时使用）
+
+        Returns:
+            tuple: (resolved_path: str, is_valid: bool, error_message: str)
+        """
+        # 如果没有提供默认路径，使用根目录
+        if default_path is None:
+            default_path = '/'
+
+        # 验证路径格式
+        is_valid, error_msg, normalized_path = self.validate_path_format(frontend_path)
+        if not is_valid:
+            print(f"[PATH-RESOLVE] 路径格式无效: {error_msg}")
+            return (default_path, False, error_msg)
+
+        frontend_path = normalized_path
+
+        # 处理 ~ 路径（需要SSH客户端解析）
+        if frontend_path == '~' or frontend_path.startswith('~/'):
+            if ssh_client:
+                try:
+                    stdin, stdout, stderr = ssh_client.exec_command("echo $HOME", timeout=2)
+                    home_dir = stdout.read().decode('utf-8', errors='ignore').strip()
+                    stderr.read()  # 消费错误输出
+
+                    if home_dir and home_dir.startswith('/'):
+                        if frontend_path == '~':
+                            print(f"[PATH-RESOLVE] ~ 解析为: {home_dir}")
+                            return (home_dir, True, "")
+                        else:
+                            # ~/subdir -> /home/user/subdir
+                            expanded = home_dir + frontend_path[1:]
+                            print(f"[PATH-RESOLVE] {frontend_path} 展开为: {expanded}")
+                            frontend_path = expanded
+                    else:
+                        print(f"[PATH-RESOLVE] 获取HOME失败，使用默认路径")
+                        return (default_path, False, "无法获取HOME目录")
+                except Exception as e:
+                    print(f"[PATH-RESOLVE] 获取HOME异常: {e}")
+                    return (default_path, False, f"获取HOME异常: {e}")
+            else:
+                # 没有SSH客户端，无法解析 ~ 路径
+                print(f"[PATH-RESOLVE] 无SSH客户端，无法解析 ~ 路径")
+                return (default_path, False, "无SSH客户端，无法解析~路径")
+
+        # 处理绝对路径
+        if frontend_path.startswith('/'):
+            if ssh_client:
+                try:
+                    safe_path = self.escape_shell_path(frontend_path)
+                    check_cmd = f"cd '{safe_path}' 2>/dev/null && pwd"
+                    stdin, stdout, stderr = ssh_client.exec_command(check_cmd, timeout=2)
+                    real_path = stdout.read().decode('utf-8', errors='ignore').strip()
+                    error = stderr.read().decode('utf-8', errors='ignore').strip()
+
+                    if real_path and not error and real_path.startswith('/'):
+                        print(f"[PATH-RESOLVE] 绝对路径验证成功: {real_path}")
+                        return (real_path, True, "")
+                    else:
+                        print(f"[PATH-RESOLVE] 绝对路径无效: {frontend_path}")
+                        return (default_path, False, f"路径不存在或无法访问: {frontend_path}")
+                except Exception as e:
+                    print(f"[PATH-RESOLVE] 绝对路径验证异常: {e}")
+                    # 验证异常时信任前端路径格式
+                    return (frontend_path, True, f"验证异常但信任格式: {e}")
+            else:
+                # 没有SSH客户端，信任前端绝对路径格式
+                print(f"[PATH-RESOLVE] 无SSH客户端，信任绝对路径: {frontend_path}")
+                return (frontend_path, True, "")
+
+        # 相对路径需要基准目录，但我们不使用缓存，所以需要默认路径
+        if ssh_client:
+            try:
+                safe_default = self.escape_shell_path(default_path)
+                safe_frontend = self.escape_shell_path(frontend_path)
+
+                if default_path and default_path != '~' and default_path.startswith('/'):
+                    resolve_cmd = f"cd '{safe_default}' && cd '{safe_frontend}' 2>/dev/null && pwd"
+                else:
+                    resolve_cmd = f"cd '{safe_frontend}' 2>/dev/null && pwd"
+
+                stdin, stdout, stderr = ssh_client.exec_command(resolve_cmd, timeout=2)
+                real_path = stdout.read().decode('utf-8', errors='ignore').strip()
+                stderr.read()  # 消费错误输出
+
+                if real_path and real_path.startswith('/'):
+                    print(f"[PATH-RESOLVE] 相对路径解析: {frontend_path} -> {real_path}")
+                    return (real_path, True, "")
+                else:
+                    print(f"[PATH-RESOLVE] 相对路径解析失败: {frontend_path}")
+                    return (default_path, False, f"相对路径无效: {frontend_path}")
+            except Exception as e:
+                print(f"[PATH-RESOLVE] 相对路径解析异常: {e}")
+                return (default_path, False, f"相对路径解析异常: {e}")
+
+        # 没有SSH客户端且是相对路径，无法解析
+        print(f"[PATH-RESOLVE] 无SSH客户端，无法解析相对路径: {frontend_path}")
+        return (default_path, False, "无SSH客户端，无法解析相对路径")
+
     def sync_cwd_from_frontend(self, session_id: str, frontend_path: str, ssh_client: paramiko.SSHClient = None, skip_validation: bool = False) -> str:
         """
         从前端同步当前工作目录
-        处理前端发送的 currentPath 参数，确保前后端路径一致
+        处理前端发送的 currentPath 参数
+
+        注意：此方法为兼容性保留，内部使用 resolve_frontend_path 纯函数
+        后端不主动存储路径，仅在必要时更新缓存作为回退
 
         Args:
             session_id: 会话ID
@@ -203,83 +386,60 @@ class SSHSessionManager:
             skip_validation: 是否跳过 SSH 验证（用于 cd 命令，避免重复验证）
 
         Returns:
-            str: 同步后的有效路径
+            str: 解析后的有效路径
         """
-        if not frontend_path:
-            return self.get_cwd(session_id)
+        # 获取后端缓存路径作为默认值（仅用于回退）
+        backend_path = self.get_cwd(session_id)
+
+        # 如果前端路径为空或无效，返回后端缓存路径
+        if not frontend_path or not frontend_path.strip():
+            print(f"[CWD-SYNC] 前端路径为空，使用后端路径: {backend_path}")
+            return backend_path
 
         # 规范化前端路径
         frontend_path = frontend_path.strip()
-        if not frontend_path:
-            return self.get_cwd(session_id)
 
-        # 获取后端缓存的路径
-        backend_path = self.get_cwd(session_id)
+        # 如果跳过验证（如cd命令），直接处理绝对路径
+        if skip_validation:
+            is_valid, error_msg, normalized = self.validate_path_format(frontend_path)
+            if is_valid and normalized.startswith('/'):
+                print(f"[CWD-SYNC] 跳过验证，使用前端绝对路径: {normalized}")
+                return normalized
+            elif is_valid and (normalized == '~' or normalized.startswith('~/')):
+                # ~ 路径需要展开
+                if ssh_client:
+                    try:
+                        stdin, stdout, stderr = ssh_client.exec_command("echo $HOME", timeout=2)
+                        home_dir = stdout.read().decode('utf-8', errors='ignore').strip()
+                        stderr.read()
+                        if home_dir and home_dir.startswith('/'):
+                            if normalized == '~':
+                                print(f"[CWD-SYNC] ~ 展开为: {home_dir}")
+                                return home_dir
+                            else:
+                                expanded = home_dir + normalized[1:]
+                                print(f"[CWD-SYNC] {normalized} 展开为: {expanded}")
+                                return expanded
+                    except Exception as e:
+                        print(f"[CWD-SYNC] 展开~失败: {e}")
+                # 无法展开，返回原始值
+                return normalized if is_valid else backend_path
+            elif is_valid:
+                # 相对路径，跳过验证时直接返回
+                print(f"[CWD-SYNC] 跳过验证，使用前端路径: {normalized}")
+                return normalized
 
-        # 如果路径一致，直接返回
-        if frontend_path == backend_path:
-            return backend_path
+        # 使用纯函数解析路径
+        resolved_path, is_valid, error_msg = self.resolve_frontend_path(
+            frontend_path, ssh_client, backend_path
+        )
 
-        # 处理 ~ 路径
-        if frontend_path == '~':
-            with self.lock:
-                home_dir = self.home_dir_cache.get(session_id)
-            if home_dir:
-                frontend_path = home_dir
-            else:
-                # 没有缓存的 home 目录，返回后端路径
-                return backend_path
+        if is_valid:
+            print(f"[CWD-SYNC] 路径解析成功: {frontend_path} -> {resolved_path}")
+        else:
+            print(f"[CWD-SYNC] 路径解析失败: {error_msg}，使用: {resolved_path}")
 
-        # 安全检查：转义危险字符，防止命令注入
-        def escape_path(path: str) -> str:
-            """转义路径中的危险字符"""
-            # 替换单引号为 '\''
-            return path.replace("'", "'\"'\"'")
-
-        # 如果跳过验证，直接信任绝对路径
-        if skip_validation and frontend_path.startswith('/'):
-            with self.lock:
-                self.cwd_cache[session_id] = frontend_path
-            return frontend_path
-
-        # 如果有 SSH 客户端且需要验证，验证前端路径是否有效
-        if ssh_client and frontend_path.startswith('/'):
-            try:
-                # 验证路径是否存在（使用转义后的路径）
-                safe_path = escape_path(frontend_path)
-                check_cmd = f"cd '{safe_path}' 2>/dev/null && pwd"
-                stdin, stdout, stderr = ssh_client.exec_command(check_cmd, timeout=2)
-                real_path = stdout.read().decode('utf-8', errors='ignore').strip()
-                error = stderr.read().decode('utf-8', errors='ignore').strip()
-
-                if real_path and not error and real_path.startswith('/'):
-                    # 前端路径有效，更新后端缓存
-                    with self.lock:
-                        self.cwd_cache[session_id] = real_path
-                    print(f"[CWD-SYNC] 前端路径有效，更新缓存: {real_path}")
-                    return real_path
-                else:
-                    # 前端路径无效，使用后端路径
-                    print(f"[CWD-SYNC] 前端路径无效({frontend_path})，使用后端路径: {backend_path}")
-                    return backend_path
-            except Exception as e:
-                print(f"[CWD-SYNC] 验证失败: {e}")
-                # 验证失败时，如果前端路径看起来像有效路径，信任它
-                if frontend_path.startswith('/'):
-                    with self.lock:
-                        self.cwd_cache[session_id] = frontend_path
-                    return frontend_path
-                return backend_path
-
-        # 如果是绝对路径但没有SSH客户端，信任前端
-        if frontend_path.startswith('/'):
-            with self.lock:
-                self.cwd_cache[session_id] = frontend_path
-            print(f"[CWD-SYNC] 信任前端绝对路径: {frontend_path}")
-            return frontend_path
-
-        # 其他情况使用后端路径
-        return backend_path
+        return resolved_path
 
     def get_username(self, session_id: str) -> str:
         return "root"
@@ -896,12 +1056,13 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     # 对于 cd 命令，跳过 SSH 验证（cd 命令会自己更新路径，避免重复验证）
                     frontend_path = message["data"].get("currentPath", "")
                     is_cd_command = command.strip().startswith('cd ') or command.strip() == 'cd'
-                    if frontend_path:
-                        synced_cwd = app.state.ssh_manager.sync_cwd_from_frontend(
-                            session_id, frontend_path, ssh_client,
-                            skip_validation=is_cd_command  # cd 命令跳过验证
-                        )
-                        print(f"[CMD] 前端路径: {frontend_path}, 同步后: {synced_cwd}, cd命令: {is_cd_command}")
+
+                    # 始终同步前端路径，确保后端缓存与前端一致
+                    synced_cwd = app.state.ssh_manager.sync_cwd_from_frontend(
+                        session_id, frontend_path, ssh_client,
+                        skip_validation=is_cd_command  # cd 命令跳过验证
+                    )
+                    print(f"[CMD] 前端路径: {frontend_path}, 同步后: {synced_cwd}, cd命令: {is_cd_command}")
 
                     app.state.ssh_manager.add_command_to_history(session_id, command)
 
@@ -912,8 +1073,9 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         has_ops = any(op in command for op in ['|', ';', '&&', '||'])
 
                         if simple_ls and not has_ops:
-                            current_dir = app.state.ssh_manager.get_cwd(session_id)
-                            print(f"[LS] 获取当前目录: {current_dir} (session_id: {session_id})")
+                            # 使用同步后的路径，确保与前端一致
+                            current_dir = synced_cwd
+                            print(f"[LS] 使用同步后的目录: {current_dir} (session_id: {session_id})")
                             terminal_width = 80
                             ls_structured = app.state.ssh_manager.process_ls_structured(
                                 ssh_client, command, session_id, current_dir, terminal_width
@@ -954,7 +1116,8 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             simple_ls = re.match(r"^\s*ls(\s|$)", command) is not None
                             has_ops = any(op in command for op in ['|', ';', '&&', '||'])
                             if simple_ls and not has_ops:
-                                current_dir = app.state.ssh_manager.get_cwd(session_id)
+                                # 使用同步后的路径
+                                current_dir = synced_cwd
                                 home_dir = app.state.ssh_manager.home_dir_cache.get(session_id, '/root')
                                 if current_dir == home_dir:
                                     display_dir = '~'
@@ -1094,8 +1257,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                 completions = [c.strip() for c in out_data.split('\n') if c.strip()]
                             else:
                                 ls_cmd = "ls -1F --color=never"
-                                if cwd != '~':
-                                    ls_cmd = f"cd {cwd} && {ls_cmd}"
+                                if cwd != '~' and cwd:
+                                    # 使用安全转义的路径
+                                    safe_cwd = app.state.ssh_manager.escape_shell_path(cwd)
+                                    ls_cmd = f"cd '{safe_cwd}' && {ls_cmd}"
 
                                 print(f"[TAB] 补全列表: {ls_cmd}")
                                 stdin, stdout, stderr = ssh_client.exec_command(ls_cmd, timeout=5)
