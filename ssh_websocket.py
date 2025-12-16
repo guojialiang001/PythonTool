@@ -1187,8 +1187,30 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                             else:
                                 target = '~'
 
-                            # 后台执行获取真实路径
-                            pwd_cmd = f"cd {target} 2>/dev/null && pwd || echo $HOME"
+                            # 使用前端同步的路径作为基础目录
+                            base_dir = synced_cwd
+
+                            # 构建后台执行命令，需要考虑基础目录
+                            # 逻辑：先切换到基础目录，再执行cd，成功返回新路径，失败返回基础目录
+                            if target.startswith('/'):
+                                # 绝对路径：直接cd到目标，失败则返回基础目录
+                                safe_base = app.state.ssh_manager.escape_shell_path(base_dir)
+                                pwd_cmd = f"cd {target} 2>/dev/null && pwd || echo '{safe_base}'"
+                            elif target == '~' or target.startswith('~/'):
+                                # home路径：直接cd，失败则返回基础目录
+                                safe_base = app.state.ssh_manager.escape_shell_path(base_dir)
+                                pwd_cmd = f"cd {target} 2>/dev/null && pwd || echo '{safe_base}'"
+                            elif base_dir and base_dir.startswith('/'):
+                                # 相对路径 + 绝对基础目录：先切换到基础目录再cd
+                                safe_base = app.state.ssh_manager.escape_shell_path(base_dir)
+                                # 先cd到基础目录，然后尝试cd到目标
+                                # 成功则pwd返回新目录，失败则pwd返回基础目录
+                                pwd_cmd = f"cd '{safe_base}' && (cd {target} 2>/dev/null && pwd || pwd)"
+                            else:
+                                # 其他情况（如基础目录是~）
+                                pwd_cmd = f"cd {target} 2>/dev/null && pwd || pwd"
+
+                            print(f"[CWD] 执行命令: {pwd_cmd} (base_dir={base_dir}, target={target})")
                             stdin, stdout, stderr = ssh_client.exec_command(pwd_cmd, timeout=2)
                             real_cwd = stdout.read().decode('utf-8', errors='ignore').strip()
 
