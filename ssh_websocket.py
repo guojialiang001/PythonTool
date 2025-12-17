@@ -1022,9 +1022,29 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         # 清理ANSI序列
                         try:
                             data_for_send = data
-                            data_for_send = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
-                            data_for_send = re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
+                            # DCS序列 (vim等使用): \x1bP...\x1b\\
+                            data_for_send = re.sub(r"\x1bP[^\x1b]*\x1b\\", "", data_for_send)
+                            # APC序列 (Application Program Command): \x1b_...\x1b\\
+                            data_for_send = re.sub(r"\x1b_[^\x1b]*\x1b\\", "", data_for_send)
+                            # PM序列 (Privacy Message): \x1b^...\x1b\\
+                            data_for_send = re.sub(r"\x1b\^[^\x1b]*\x1b\\", "", data_for_send)
+                            # SOS序列 (Start of String): \x1bX...\x1b\\
+                            data_for_send = re.sub(r"\x1bX[^\x1b]*\x1b\\", "", data_for_send)
+                            # OSC序列: \x1b]...\x07 或 \x1b]...\x1b\\
                             data_for_send = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", data_for_send)
+                            # 扩展CSI序列 (DA2等): \x1b[>... 或 \x1b[?...
+                            data_for_send = re.sub(r"\x1b\[[>?][0-9;]*[a-zA-Z]", "", data_for_send)
+                            # 百分号CSI序列: \x1b[...%...
+                            data_for_send = re.sub(r"\x1b\[[0-9;]*%[a-zA-Z]", "", data_for_send)
+                            # 光标样式序列: \x1b[... q (带空格)
+                            data_for_send = re.sub(r"\x1b\[[0-9;]* q", "", data_for_send)
+                            # 标准CSI序列: \x1b[...
+                            data_for_send = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
+                            # 括号粘贴模式
+                            data_for_send = re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
+                            # 单字符转义序列 (键盘模式等): \x1b= \x1b> \x1b7 \x1b8 \x1bc 等
+                            data_for_send = re.sub(r"\x1b[=><78cNOM]", "", data_for_send)
+                            # 清理换行
                             data_for_send = data_for_send.replace("\r\n", "\n").replace("\r", "\n")
                         except Exception:
                             data_for_send = data
