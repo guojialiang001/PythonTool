@@ -12,6 +12,191 @@ import re
 from contextlib import asynccontextmanager
 from collections import deque
 
+
+# 终端控制序列处理器 - 处理VIM等全屏应用的格式问题
+class TerminalSequenceProcessor:
+    """
+    通用终端控制序列处理器
+    处理所有全屏应用的格式问题，确保左侧对齐
+    """
+
+    @staticmethod
+    def normalize_control_sequences(data: str) -> str:
+        """
+        规范化终端控制序列，确保左侧对齐
+        """
+        if not data:
+            return data
+
+        # 1. 检测是否是全屏应用
+        is_fullscreen = TerminalSequenceProcessor._detect_fullscreen_app(data)
+
+        # 2. 应用序列处理
+        processed_data = data
+
+        if is_fullscreen:
+            print(f"[TERMINAL] 检测到全屏应用，应用高级处理")
+
+            # 必须过滤的破坏性序列
+            destructive_patterns = [
+                # 终端状态查询和响应（这些会破坏布局）
+                r'\x1b\[>[0-9;]*[c]',        # 终端ID响应
+                r'\x1b\[=[0-9;]*[hl]',       # 键盘模式
+                r'\x1b\[>[0-9;]*[m]',        # 扩展模式
+
+                # 私有序列（vim, htop等使用，但会破坏web终端）
+                r'\x1bP[^\x1b]*\x1b\\',      # DCS序列
+                r'\x1b_[^\x1b]*\x1b\\',      # APC序列
+                r'\x1b\^[^\x1b]*\x1b\\',     # PM序列
+                r'\x1bX[^\x1b]*\x1b\\',      # SOS序列
+                r'\x1b\][^\x07]*(?:\x07|\x1b\\)',  # OSC序列
+
+                # 杂散序列
+                r'\x1b=',                    # 应用键盘模式
+                r'\x1b>',                    # 普通键盘模式
+                r'\x1bN',                    # 单移入
+                r'\x1bO',                    # 单移出
+            ]
+
+            # 过滤破坏性序列
+            for pattern in destructive_patterns:
+                processed_data = re.sub(pattern, '', processed_data)
+
+            # 确保左侧对齐的关键步骤
+            processed_data = TerminalSequenceProcessor._ensure_left_alignment(processed_data)
+        else:
+            # 普通模式：只过滤最破坏性的序列
+            basic_destructive = [
+                r'\x1bP[^\x1b]*\x1b\\',      # DCS序列
+                r'\x1b_[^\x1b]*\x1b\\',      # APC序列
+                r'\x1b\[>[0-9;]*[c]',        # 终端ID响应
+            ]
+            for pattern in basic_destructive:
+                processed_data = re.sub(pattern, '', processed_data)
+
+        # 3. 规范化换行符
+        processed_data = TerminalSequenceProcessor._normalize_line_endings(processed_data)
+
+        return processed_data
+
+    @staticmethod
+    def _detect_fullscreen_app(data: str) -> bool:
+        """检测是否是全屏应用输出"""
+        fullscreen_indicators = [
+            # vim/nvi/vi
+            r'"\w+\.[a-zA-Z]+"\s+\d+L,\s+\d+B',  # vim状态栏
+            r'\x1bPzz',                           # vim私有序列
+            r'~\s*$',                             # vim空行标记
+
+            # htop/top
+            r'\d+:\d+:\d+',                       # 时间显示
+            r'Mem\s*\[',                          # 内存条
+            r'CPU\s*\[',                          # CPU条
+
+            # nano
+            r'^GNU nano',                         # nano标识
+            r'^Get Help',                         # nano帮助
+
+            # less/more
+            r'lines?\s*\d+-\d+/\d+',              # 分页显示
+
+            # 光标定位序列密集出现
+            r'(\x1b\[\d+;\d+H.*?){3,}',           # 3个以上光标定位
+
+            # 清屏序列
+            r'\x1b\[2J.*?\x1b\[\d+;\d+H',         # 清屏+定位
+        ]
+
+        for pattern in fullscreen_indicators:
+            if re.search(pattern, data):
+                return True
+
+        # 统计控制序列密度
+        control_seq_count = len(re.findall(r'\x1b\[', data))
+        total_length = len(data)
+
+        if total_length > 100 and control_seq_count > 5:
+            # 控制序列密度高，可能是全屏应用
+            seq_density = control_seq_count / total_length
+            if seq_density > 0.05:  # 5%的字符是控制序列
+                return True
+
+        return False
+
+    @staticmethod
+    def _ensure_left_alignment(data: str) -> str:
+        """确保内容左侧对齐"""
+        # 1. 移除左侧的杂散空格和制表符（在控制序列之后）
+        lines = data.split('\n')
+        cleaned_lines = []
+
+        for line in lines:
+            if not line.strip():
+                cleaned_lines.append('')
+                continue
+
+            # 检查是否有光标定位
+            cursor_match = re.match(r'(\x1b\[\d+;\d+H)(.*)', line)
+            if cursor_match:
+                cursor_seq, content = cursor_match.groups()
+                # 移除定位后内容左侧的多余空格
+                content = content.lstrip()
+                cleaned_lines.append(cursor_seq + content)
+            else:
+                # 普通行，移除左侧空格但保留一个缩进
+                cleaned_line = line.lstrip()
+                if cleaned_line and not cleaned_line.startswith('\x1b'):
+                    # 如果不是控制序列开始，添加一个空格缩进
+                    cleaned_line = ' ' + cleaned_line
+                cleaned_lines.append(cleaned_line)
+
+        # 2. 确保每行从第一列开始（除非有明确的定位）
+        aligned_lines = []
+        for line in cleaned_lines:
+            # 如果行以回车+换行开始，确保正确对齐
+            if line.startswith('\r'):
+                line = line[1:]  # 移除回车
+
+            # 如果行以控制序列开始但不是光标定位，确保后面跟实际内容
+            if line.startswith('\x1b[') and 'H' not in line[:10]:
+                # 查找控制序列结束
+                seq_end_match = re.search(r'[A-Za-z]', line[2:])
+                if seq_end_match:
+                    seq_end = seq_end_match.start() + 3
+                    seq = line[:seq_end]
+                    content = line[seq_end:]
+                    if not content.strip():
+                        continue  # 跳过只有控制序列的行
+                    line = seq + content.lstrip()
+
+            aligned_lines.append(line)
+
+        # 3. 重建数据，确保正确的行结束符
+        return '\n'.join(aligned_lines)
+
+    @staticmethod
+    def _normalize_line_endings(data: str) -> str:
+        """规范化行结束符"""
+        # 统一为 \n
+        data = data.replace('\r\n', '\n').replace('\r', '\n')
+
+        # 移除过多的空行（保留最多2个连续空行）
+        lines = data.split('\n')
+        cleaned_lines = []
+        empty_count = 0
+
+        for line in lines:
+            if not line.strip():
+                empty_count += 1
+                if empty_count <= 2:
+                    cleaned_lines.append('')
+            else:
+                empty_count = 0
+                cleaned_lines.append(line)
+
+        return '\n'.join(cleaned_lines)
+
+
 # SSH连接信息模型
 class SSHConnection(BaseModel):
     hostname: str
@@ -1019,34 +1204,17 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         except Exception:
                             pass
 
-                        # 清理ANSI序列
+                        # 应用通用终端序列处理（智能检测全屏应用如VIM）
                         try:
-                            data_for_send = data
-                            # DCS序列 (vim等使用): \x1bP...\x1b\\
-                            data_for_send = re.sub(r"\x1bP[^\x1b]*\x1b\\", "", data_for_send)
-                            # APC序列 (Application Program Command): \x1b_...\x1b\\
-                            data_for_send = re.sub(r"\x1b_[^\x1b]*\x1b\\", "", data_for_send)
-                            # PM序列 (Privacy Message): \x1b^...\x1b\\
-                            data_for_send = re.sub(r"\x1b\^[^\x1b]*\x1b\\", "", data_for_send)
-                            # SOS序列 (Start of String): \x1bX...\x1b\\
-                            data_for_send = re.sub(r"\x1bX[^\x1b]*\x1b\\", "", data_for_send)
-                            # OSC序列: \x1b]...\x07 或 \x1b]...\x1b\\
-                            data_for_send = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", data_for_send)
-                            # 扩展CSI序列 (DA2等): \x1b[>... 或 \x1b[?...
-                            data_for_send = re.sub(r"\x1b\[[>?][0-9;]*[a-zA-Z]", "", data_for_send)
-                            # 百分号CSI序列: \x1b[...%...
-                            data_for_send = re.sub(r"\x1b\[[0-9;]*%[a-zA-Z]", "", data_for_send)
-                            # 光标样式序列: \x1b[... q (带空格)
-                            data_for_send = re.sub(r"\x1b\[[0-9;]* q", "", data_for_send)
-                            # 标准CSI序列: \x1b[...
-                            data_for_send = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
-                            # 括号粘贴模式
-                            data_for_send = re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
-                            # 单字符转义序列 (键盘模式等): \x1b= \x1b> \x1b7 \x1b8 \x1bc 等
-                            data_for_send = re.sub(r"\x1b[=><78cNOM]", "", data_for_send)
-                            # 清理换行
-                            data_for_send = data_for_send.replace("\r\n", "\n").replace("\r", "\n")
-                        except Exception:
+                            data_for_send = TerminalSequenceProcessor.normalize_control_sequences(data)
+
+                            # 调试日志：记录处理变化
+                            if data != data_for_send:
+                                diff_ratio = 1.0 - (len(data_for_send) / max(len(data), 1))
+                                if diff_ratio > 0.1:  # 变化超过10%
+                                    print(f"[TERMINAL] 处理了 {len(data)} -> {len(data_for_send)} 字节 (变化: {diff_ratio:.1%})")
+                        except Exception as e:
+                            print(f"[TERMINAL] 序列处理失败: {e}")
                             data_for_send = data
 
                         # 获取当前真实路径
