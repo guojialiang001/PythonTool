@@ -37,7 +37,15 @@ class TerminalSequenceProcessor:
         if is_fullscreen:
             print(f"[TERMINAL] 检测到全屏应用，应用高级处理")
 
-            # 必须过滤的破坏性序列
+            # 1. 规范化 SGR 序列（颜色、样式等），确保兼容性
+            # 只保留基本格式化代码（0-49），过滤可能导致问题的扩展颜色
+            processed_data = re.sub(
+                r'\x1b\[([0-9;]*)m',
+                TerminalSequenceProcessor._normalize_sgr,
+                processed_data
+            )
+
+            # 2. 必须过滤的破坏性序列
             destructive_patterns = [
                 # 终端状态查询和响应（这些会破坏布局）
                 r'\x1b\[>[0-9;]*[c]',        # 终端ID响应
@@ -56,13 +64,17 @@ class TerminalSequenceProcessor:
                 r'\x1b>',                    # 普通键盘模式
                 r'\x1bN',                    # 单移入
                 r'\x1bO',                    # 单移出
+
+                # 窗口操作序列（某些应用会发送，可能破坏布局）
+                # 注意：不过滤 r 序列（滚动区域设置），只过滤 t 序列（窗口操作）
+                r'\x1b\[[0-9;]+t',  # 窗口大小/位置操作（如 8;24;80t）
             ]
 
-            # 过滤破坏性序列
+            # 3. 过滤破坏性序列
             for pattern in destructive_patterns:
                 processed_data = re.sub(pattern, '', processed_data)
 
-            # 确保左侧对齐的关键步骤
+            # 4. 确保左侧对齐的关键步骤
             processed_data = TerminalSequenceProcessor._ensure_left_alignment(processed_data)
         else:
             # 普通模式：只过滤最破坏性的序列
@@ -122,6 +134,31 @@ class TerminalSequenceProcessor:
                 return True
 
         return False
+
+    @staticmethod
+    def _normalize_sgr(match) -> str:
+        """
+        规范化SGR（选择图形再现）序列
+        只保留基本格式化代码（0-49），过滤扩展颜色等高级代码
+        """
+        codes = match.group(1).split(';')
+        normalized_codes = []
+
+        for code in codes:
+            if code:
+                try:
+                    num = int(code)
+                    # 只保留基本格式化代码（0-49）
+                    # 0: 重置, 1-9: 样式, 30-37: 前景色, 40-47: 背景色
+                    if 0 <= num <= 49:
+                        normalized_codes.append(str(num))
+                except ValueError:
+                    pass
+
+        if normalized_codes:
+            return f'\x1b[{";".join(normalized_codes)}m'
+        else:
+            return '\x1b[0m'  # 默认重置
 
     @staticmethod
     def _ensure_left_alignment(data: str) -> str:
