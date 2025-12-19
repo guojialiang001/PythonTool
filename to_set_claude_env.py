@@ -2,7 +2,7 @@
 from set_claude_env import set_config, list_configs
 
 # 基础使用
-set_config('cpass', user_level=True)  # 系统级设置
+set_config('avoapi', user_level=True)  # 系统级设置
 # set_config('a', user_level=True)  # 用户级设置
 
 # 高级用法
