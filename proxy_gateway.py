@@ -9,6 +9,7 @@ OpenAI API 代理网关
 import asyncio
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import uvicorn
 from typing import Optional, AsyncGenerator
@@ -29,6 +30,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="OpenAI API Proxy Gateway")
+
+# CORS 配置 - 允许跨域请求
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源，生产环境可改为具体域名列表
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
 PROXY_CONFIG = {
     '/api/chat': {'target': 'https://api.xiaomimimo.com', 'rewrite': '/v1/chat'},
