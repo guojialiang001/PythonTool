@@ -57,18 +57,15 @@ check_pm2() {
 check_dependencies() {
     log_info "检查Python依赖..."
     
-    # 检查基础依赖
-    $PYTHON_PATH -c "import fastapi, uvicorn, httpx" 2>/dev/null
-    if [ $? -ne 0 ]; then
-        log_warning "缺少基础Python依赖，正在安装..."
-        $PYTHON_PATH -m pip install fastapi uvicorn "httpx[http2]"
-    fi
-    
     # 检查h2依赖（httpx的http2支持）
-    $PYTHON_PATH -c "import h2" 2>/dev/null
+    $PYTHON_PATH -c "import fastapi, uvicorn, httpx, h2" 2>/dev/null
     if [ $? -ne 0 ]; then
-        log_warning "缺少h2依赖（HTTP/2支持），正在安装..."
-        $PYTHON_PATH -m pip install "httpx[http2]"
+        log_warning "缺少依赖，正在从 requirements.txt 安装..."
+        if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+            $PYTHON_PATH -m pip install -r "$SCRIPT_DIR/requirements.txt"
+        else
+            $PYTHON_PATH -m pip install fastapi uvicorn "httpx[http2]"
+        fi
     fi
     
     log_success "Python依赖检查完成"
