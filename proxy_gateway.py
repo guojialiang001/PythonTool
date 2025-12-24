@@ -73,7 +73,7 @@ async def startup_event():
     logger.info("=" * 70)
     logger.info("Starting OpenAI API Proxy Gateway")
     logger.info("=" * 70)
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0), limits=HTTP_CLIENT_LIMITS, follow_redirects=True, http2=True)
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0), limits=HTTP_CLIENT_LIMITS, follow_redirects=True)
     logger.info(f"HTTP client pool initialized (max_connections={HTTP_CLIENT_LIMITS.max_connections})")
     thread_pool = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE, thread_name_prefix="proxy_worker")
     logger.info(f"Thread pool initialized (workers={THREAD_POOL_SIZE})")
