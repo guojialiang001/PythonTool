@@ -53,8 +53,11 @@ PROXY_CONFIG = {
     '/api/sonnet': {'target': 'https://aiai.li', 'rewrite': '/v1'},
     '/api/minimax': {'target': 'https://aicodelink.top', 'rewrite': '/v1'},
     '/api/grok': {'target': 'https://api.avoapi.com', 'rewrite': '/v1'},
-    '/api/minimaxm21': {'target': 'https://routerpark.com', 'rewrite': '/v1'},
+    '/api/minimaxm21': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'},
     '/api/code-relay': {'target': 'https://api.code-relay.com', 'rewrite': '/v1'},
+    '/api/qwen': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'},
+    '/api/deepseekv32': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'}
+
 }
 
 EXCLUDED_HEADERS = {
