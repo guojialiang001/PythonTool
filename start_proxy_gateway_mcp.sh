@@ -1,0 +1,306 @@
+#!/bin/bash
+#
+# OpenAI API Proxy Gateway with MCP - PM2 启动脚本
+# 使用PM2管理proxy_gateway_mcp.py进程
+# 集成 Exa MCP 搜索功能，带 30 分钟线程安全缓存
+#
+
+# 脚本所在目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# 应用名称
+APP_NAME="proxy-gateway-mcp"
+
+# Python路径（可根据需要修改）
+PYTHON_PATH="${PYTHON_PATH:-python3}"
+
+# 默认配置
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"
+WORKERS="${WORKERS:-1}"
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# 打印带颜色的消息
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_mcp() {
+    echo -e "${CYAN}[MCP]${NC} $1"
+}
+
+# 检查PM2是否安装
+check_pm2() {
+    if ! command -v pm2 &> /dev/null; then
+        log_error "PM2 未安装！请先安装PM2："
+        echo "  npm install -g pm2"
+        exit 1
+    fi
+    log_info "PM2 版本: $(pm2 --version)"
+}
+
+# 检查Python依赖
+check_dependencies() {
+    log_info "检查Python依赖..."
+    
+    # 检查h2依赖（httpx的http2支持）
+    $PYTHON_PATH -c "import fastapi, uvicorn, httpx, h2" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        log_warning "缺少依赖，正在从 requirements.txt 安装..."
+        if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+            $PYTHON_PATH -m pip install -r "$SCRIPT_DIR/requirements.txt"
+        else
+            $PYTHON_PATH -m pip install fastapi uvicorn "httpx[http2]"
+        fi
+    fi
+    
+    log_success "Python依赖检查完成"
+}
+
+# 启动服务
+start() {
+    log_info "正在启动 $APP_NAME..."
+    log_mcp "集成 Exa MCP 搜索功能"
+    log_mcp "缓存过期时间: 30 分钟"
+    
+    # 检查是否已经运行
+    pm2 describe $APP_NAME > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log_warning "$APP_NAME 已经在运行中"
+        pm2 show $APP_NAME
+        return 0
+    fi
+    
+    # 使用PM2启动Python应用
+    pm2 start "$SCRIPT_DIR/proxy_gateway_mcp.py" \
+        --name "$APP_NAME" \
+        --interpreter "$PYTHON_PATH" \
+        -- \
+        --host "$HOST" \
+        --port "$PORT" \
+        --workers "$WORKERS"
+    
+    if [ $? -eq 0 ]; then
+        log_success "$APP_NAME 启动成功！"
+        echo ""
+        pm2 show $APP_NAME
+        echo ""
+        log_info "服务地址: http://$HOST:$PORT"
+        log_mcp "MCP 接口: http://$HOST:$PORT/api/mcp/exa"
+        log_info "查看日志: pm2 logs $APP_NAME"
+    else
+        log_error "启动失败！"
+        exit 1
+    fi
+}
+
+# 停止服务
+stop() {
+    log_info "正在停止 $APP_NAME..."
+    pm2 stop $APP_NAME 2>/dev/null
+    if [ $? -eq 0 ]; then
+        log_success "$APP_NAME 已停止"
+    else
+        log_warning "$APP_NAME 未在运行"
+    fi
+}
+
+# 重启服务
+restart() {
+    log_info "正在重启 $APP_NAME..."
+    pm2 restart $APP_NAME 2>/dev/null
+    if [ $? -eq 0 ]; then
+        log_success "$APP_NAME 重启成功"
+        pm2 show $APP_NAME
+    else
+        log_warning "$APP_NAME 未在运行，正在启动..."
+        start
+    fi
+}
+
+# 删除服务
+delete() {
+    log_info "正在删除 $APP_NAME..."
+    pm2 delete $APP_NAME 2>/dev/null
+    if [ $? -eq 0 ]; then
+        log_success "$APP_NAME 已删除"
+    else
+        log_warning "$APP_NAME 不存在"
+    fi
+}
+
+# 查看状态
+status() {
+    pm2 describe $APP_NAME > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        pm2 show $APP_NAME
+        echo ""
+        log_mcp "测试 MCP 接口:"
+        echo "  curl -X POST http://localhost:$PORT/api/mcp/exa \\"
+        echo "    -H 'Content-Type: application/json' \\"
+        echo "    -d '{\"messages\": [{\"role\": \"user\", \"content\": \"test query\"}]}'"
+    else
+        log_warning "$APP_NAME 未在运行"
+    fi
+}
+
+# 查看日志
+logs() {
+    pm2 logs $APP_NAME --lines 100
+}
+
+# 实时日志
+logs_live() {
+    pm2 logs $APP_NAME
+}
+
+# 保存PM2配置（开机自启）
+save() {
+    log_info "保存PM2进程列表..."
+    pm2 save
+    log_success "进程列表已保存"
+    
+    log_info "设置开机自启..."
+    pm2 startup
+    log_info "请按照上方提示执行相应命令以启用开机自启"
+}
+
+# 测试MCP接口
+test_mcp() {
+    log_info "测试 MCP 接口..."
+    
+    # 检查服务是否运行
+    pm2 describe $APP_NAME > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log_error "$APP_NAME 未在运行，请先启动服务"
+        exit 1
+    fi
+    
+    log_mcp "发送测试请求..."
+    response=$(curl -s -X POST "http://localhost:$PORT/api/mcp/exa" \
+        -H "Content-Type: application/json" \
+        -d '{"messages": [{"role": "user", "content": "What is Python?"}]}')
+    
+    if [ $? -eq 0 ]; then
+        log_success "MCP 接口响应:"
+        echo "$response" | head -c 500
+        echo "..."
+    else
+        log_error "MCP 接口测试失败"
+    fi
+}
+
+# 显示帮助
+show_help() {
+    echo ""
+    echo "=========================================="
+    echo "  OpenAI API Proxy Gateway with MCP"
+    echo "  PM2 管理脚本"
+    echo "=========================================="
+    echo ""
+    echo "功能特性:"
+    echo "  - 集成 Exa MCP 搜索功能"
+    echo "  - 30 分钟线程安全缓存"
+    echo "  - 请求去重（防止并发重复调用）"
+    echo "  - OpenAI 兼容格式返回"
+    echo ""
+    echo "用法: $0 <命令>"
+    echo ""
+    echo "命令:"
+    echo "  start       启动服务"
+    echo "  stop        停止服务"
+    echo "  restart     重启服务"
+    echo "  delete      删除服务（从PM2中移除）"
+    echo "  status      查看服务状态"
+    echo "  logs        查看最近100行日志"
+    echo "  logs-live   实时查看日志"
+    echo "  save        保存PM2配置并设置开机自启"
+    echo "  test        测试MCP接口"
+    echo ""
+    echo "环境变量:"
+    echo "  HOST        监听地址 (默认: 0.0.0.0)"
+    echo "  PORT        监听端口 (默认: 8001)"
+    echo "  WORKERS     工作进程数 (默认: 1)"
+    echo "  PYTHON_PATH Python路径 (默认: python3)"
+    echo ""
+    echo "示例:"
+    echo "  $0 start                    # 使用默认配置启动"
+    echo "  PORT=9000 $0 start          # 使用9000端口启动"
+    echo "  $0 logs                     # 查看日志"
+    echo "  $0 restart                  # 重启服务"
+    echo "  $0 test                     # 测试MCP接口"
+    echo ""
+    echo "MCP 接口:"
+    echo "  POST /api/mcp/exa"
+    echo "  请求体: {\"messages\": [{\"role\": \"user\", \"content\": \"your query\"}]}"
+    echo ""
+}
+
+# 主入口
+main() {
+    case "$1" in
+        start)
+            check_pm2
+            check_dependencies
+            start
+            ;;
+        stop)
+            check_pm2
+            stop
+            ;;
+        restart)
+            check_pm2
+            restart
+            ;;
+        delete)
+            check_pm2
+            delete
+            ;;
+        status)
+            check_pm2
+            status
+            ;;
+        logs)
+            check_pm2
+            logs
+            ;;
+        logs-live)
+            check_pm2
+            logs_live
+            ;;
+        save)
+            check_pm2
+            save
+            ;;
+        test)
+            test_mcp
+            ;;
+        *)
+            show_help
+            exit 0
+            ;;
+    esac
+}
+
+# 执行
+main "$@"

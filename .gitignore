@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Project specific
+*.mp4
+*.avi
+*.mov
+*.wmv
+*.flv
+*.mkv
+*.mp3
+*.aac
+*.wav
+*.ogg
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Logs and temp
+*.log
+temp/
+tmp/
+
+# Misc
+*.bak
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
