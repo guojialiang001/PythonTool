@@ -273,7 +273,7 @@ async def call_exa_mcp(query: str, request_id: str) -> Dict[str, Any]:
         
         # 调试日志：打印原始响应
         raw_text = response.text
-        logger.info(f"[{request_id}] MCP Raw Response: {raw_text}")
+        logger.info(f"[{request_id}] MCP Raw Response: {raw_text[:500]}...")
         
         try:
             result = response.json()
@@ -306,6 +306,107 @@ async def call_exa_mcp(query: str, request_id: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"[{request_id}] MCP Call Error: {str(e)}")
         raise
+
+
+async def get_mcp_context(query: str, request_id: str) -> Optional[str]:
+    """
+    获取 MCP 搜索结果作为上下文（带缓存和请求去重）
+    
+    返回:
+        搜索结果文本，如果失败则返回 None
+    """
+    acquired = False
+    try:
+        # 尝试获取执行权或等待其他请求完成
+        acquired, cached_result = await mcp_cache.acquire_or_wait(query)
+        
+        if not acquired:
+            # 缓存命中或等待其他请求完成后获得结果
+            logger.info(f"[{request_id}] MCP context from cache for: {query[:50]}")
+            if cached_result and "text" in cached_result:
+                return cached_result["text"]
+            return None
+        
+        # 获得执行权，调用 MCP
+        logger.info(f"[{request_id}] Fetching MCP context for: {query[:50]}")
+        mcp_res = await call_exa_mcp(query, request_id)
+        
+        # 存入缓存（存储 text 字段）
+        mcp_cache.set(query, {"text": mcp_res["text"]})
+        
+        return mcp_res["text"]
+        
+    except Exception as e:
+        logger.error(f"[{request_id}] MCP Context Error: {str(e)}")
+        return None
+    
+    finally:
+        if acquired and query:
+            await mcp_cache.release(query)
+
+
+def extract_user_query(body_json: dict) -> Optional[str]:
+    """
+    从请求体中提取用户的查询内容
+    支持 OpenAI 格式的 messages 数组
+    """
+    messages = body_json.get("messages", [])
+    if not messages:
+        return None
+    
+    # 获取最后一条用户消息
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            elif isinstance(content, list):
+                # 处理多模态消息
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        return item.get("text", "")
+    return None
+
+
+def inject_mcp_context(body_json: dict, mcp_context: str) -> dict:
+    """
+    将 MCP 搜索结果注入到请求体中
+    作为 system 消息添加到 messages 开头
+    """
+    messages = body_json.get("messages", [])
+    
+    # 构建 MCP 上下文消息
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    mcp_system_message = {
+        "role": "system",
+        "content": f"""[MCP Search Context - Retrieved at {current_time}]
+The following is real-time search information that may help answer the user's question:
+
+{mcp_context}
+
+[End of Search Context]
+Please use this information to provide an accurate and up-to-date response."""
+    }
+    
+    # 检查是否已有 system 消息
+    new_messages = []
+    has_system = False
+    for msg in messages:
+        if msg.get("role") == "system":
+            has_system = True
+            # 将 MCP 上下文追加到现有 system 消息
+            original_content = msg.get("content", "")
+            msg = msg.copy()
+            msg["content"] = f"{original_content}\n\n{mcp_system_message['content']}"
+        new_messages.append(msg)
+    
+    if not has_system:
+        # 在开头插入 MCP system 消息
+        new_messages.insert(0, mcp_system_message)
+    
+    body_json = body_json.copy()
+    body_json["messages"] = new_messages
+    return body_json
 
 def format_to_openai(query: str, search_result: str) -> Dict[str, Any]:
     """将搜索结果包装成 OpenAI chat.completions 格式"""
@@ -440,13 +541,35 @@ async def proxy_handler(request: Request, path: str):
     logger.info(f"[{request_id}] PROXY: {method} {full_path} -> {target_url}")
 
     try:
-        # 检查是否是流式请求 (简单判断)
+        # 检查是否是聊天请求，需要注入 MCP 上下文
+        body_json = None
+        is_chat_request = False
         is_stream = False
-        if body:
+        
+        if body and method == "POST":
             try:
                 body_json = json.loads(body)
                 is_stream = body_json.get('stream', False)
-            except: pass
+                # 检查是否是聊天完成请求（包含 messages 字段）
+                if "messages" in body_json and full_path.endswith("/chat/completions"):
+                    is_chat_request = True
+            except:
+                pass
+        
+        # 如果是聊天请求，先调用 MCP 获取上下文
+        if is_chat_request and body_json:
+            user_query = extract_user_query(body_json)
+            if user_query:
+                logger.info(f"[{request_id}] MCP: Fetching context for user query: {user_query[:100]}...")
+                mcp_context = await get_mcp_context(user_query, request_id)
+                
+                if mcp_context:
+                    logger.info(f"[{request_id}] MCP: Context retrieved, injecting into request")
+                    body_json = inject_mcp_context(body_json, mcp_context)
+                    # 重新序列化请求体
+                    body = json.dumps(body_json).encode('utf-8')
+                else:
+                    logger.warning(f"[{request_id}] MCP: No context retrieved, proceeding without MCP")
 
         if is_stream:
             req = http_client.build_request(method, target_url, headers=headers, content=body)
@@ -474,9 +597,9 @@ async def proxy_handler(request: Request, path: str):
                 response_headers.pop(h, None)
             
             return Response(
-                content=response.content, 
-                status_code=response.status_code, 
-                headers=response_headers, 
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
                 media_type=response_headers.get('content-type')
             )
 
