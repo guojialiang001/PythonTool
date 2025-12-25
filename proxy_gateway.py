@@ -34,8 +34,8 @@ app = FastAPI(title="OpenAI API Proxy Gateway")
 # CORS 配置 - 允许跨域请求
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源，生产环境可改为具体域名列表
-    allow_credentials=True,
+    allow_origins=["*"],  # 允许所有来源
+    allow_credentials=False,  # 当 allow_origins 为 * 时，credentials 必须为 False
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -125,7 +125,13 @@ def build_target_url(path: str, prefix: str, config: dict) -> str:
 
 
 def filter_headers(headers: dict) -> dict:
-    return {k: v for k, v in headers.items() if k.lower() not in EXCLUDED_HEADERS}
+    """过滤请求头，移除不应转发的头"""
+    filtered = {k: v for k, v in headers.items() if k.lower() not in EXCLUDED_HEADERS}
+    # 移除 Accept-Encoding 以避免上游返回压缩数据
+    # 因为我们需要流式传输原始数据
+    filtered.pop('accept-encoding', None)
+    filtered.pop('Accept-Encoding', None)
+    return filtered
 
 
 def extract_request_info(body: bytes) -> dict:
@@ -180,6 +186,9 @@ async def stream_response(response: httpx.Response, request_id: str, start_time:
         async for chunk in response.aiter_bytes():
             chunk_count += 1
             total_bytes += len(chunk)
+            # 调试日志：打印每个 chunk 的内容
+            if chunk_count <= 3:  # 只打印前3个chunk避免日志过多
+                logger.debug(f"[{request_id}] CHUNK {chunk_count}: {chunk[:200]}")
             yield chunk
                 
     except Exception as e:
@@ -245,10 +254,22 @@ async def proxy_request(request: Request, target_url: str, request_id: str) -> R
             logger.info(f"[{request_id}]    Status: {upstream_response.status_code}, Time to 1st byte: {elapsed:.3f}s")
 
             # 使用独立的流式响应生成器，并透传状态码
+            # 构建响应头，确保流式传输正常工作
+            response_headers = {
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',  # 禁用 nginx 缓冲
+            }
+            # 复制上游响应的相关头
+            for key in ['x-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining']:
+                if key in upstream_response.headers:
+                    response_headers[key] = upstream_response.headers[key]
+            
             return StreamingResponse(
                 stream_response(upstream_response, request_id, start_time),
                 status_code=upstream_response.status_code,
-                media_type=upstream_response.headers.get('content-type', 'text/event-stream')
+                media_type=upstream_response.headers.get('content-type', 'text/event-stream'),
+                headers=response_headers
             )
         else:
             logger.info(f"[{request_id}] Sending request to upstream...")
