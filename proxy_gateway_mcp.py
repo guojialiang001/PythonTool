@@ -578,30 +578,45 @@ async def proxy_handler(request: Request, path: str):
             except:
                 pass
         
-        # 如果是聊天请求，先调用 MCP 获取上下文
+        # 如果是聊天请求，检查是否需要联网搜索（web_search: true）
         if is_chat_request and body_json:
-            user_query = extract_user_query(body_json)
-            if user_query:
-                logger.info(f"[{request_id}] " + "=" * 60)
-                logger.info(f"[{request_id}] MCP INTEGRATION START")
-                logger.info(f"[{request_id}] " + "=" * 60)
-                logger.info(f"[{request_id}] User Query: {user_query}")
-                logger.info(f"[{request_id}] Fetching MCP context...")
-                
-                mcp_context = await get_mcp_context(user_query, request_id)
-                
-                if mcp_context:
-                    logger.info(f"[{request_id}] MCP: Context retrieved ({len(mcp_context)} chars), injecting into request")
-                    body_json = inject_mcp_context(body_json, mcp_context, request_id)
-                    # 重新序列化请求体
+            # 检查 web_search 参数
+            web_search_enabled = body_json.get('web_search', False)
+            
+            if web_search_enabled:
+                user_query = extract_user_query(body_json)
+                if user_query:
+                    logger.info(f"[{request_id}] " + "=" * 60)
+                    logger.info(f"[{request_id}] MCP INTEGRATION START (web_search=true)")
+                    logger.info(f"[{request_id}] " + "=" * 60)
+                    logger.info(f"[{request_id}] User Query: {user_query}")
+                    logger.info(f"[{request_id}] Fetching MCP context...")
+                    
+                    mcp_context = await get_mcp_context(user_query, request_id)
+                    
+                    if mcp_context:
+                        logger.info(f"[{request_id}] MCP: Context retrieved ({len(mcp_context)} chars), injecting into request")
+                        body_json = inject_mcp_context(body_json, mcp_context, request_id)
+                        # 移除 web_search 参数，避免传递给后端 API（后端可能不支持此参数）
+                        body_json.pop('web_search', None)
+                        # 重新序列化请求体
+                        body = json.dumps(body_json).encode('utf-8')
+                        logger.info(f"[{request_id}] MCP: Request body updated, new size: {len(body)} bytes")
+                    else:
+                        logger.warning(f"[{request_id}] MCP: No context retrieved, proceeding without MCP")
+                        # 移除 web_search 参数
+                        body_json.pop('web_search', None)
+                        body = json.dumps(body_json).encode('utf-8')
+                    
+                    logger.info(f"[{request_id}] " + "=" * 60)
+                    logger.info(f"[{request_id}] MCP INTEGRATION END")
+                    logger.info(f"[{request_id}] " + "=" * 60)
+            else:
+                logger.info(f"[{request_id}] web_search=false, skipping MCP integration")
+                # 移除 web_search 参数（如果存在）
+                if 'web_search' in body_json:
+                    body_json.pop('web_search', None)
                     body = json.dumps(body_json).encode('utf-8')
-                    logger.info(f"[{request_id}] MCP: Request body updated, new size: {len(body)} bytes")
-                else:
-                    logger.warning(f"[{request_id}] MCP: No context retrieved, proceeding without MCP")
-                
-                logger.info(f"[{request_id}] " + "=" * 60)
-                logger.info(f"[{request_id}] MCP INTEGRATION END")
-                logger.info(f"[{request_id}] " + "=" * 60)
 
         if is_stream:
             req = http_client.build_request(method, target_url, headers=headers, content=body)
