@@ -324,17 +324,29 @@ async def get_mcp_context(query: str, request_id: str) -> Optional[str]:
             # 缓存命中或等待其他请求完成后获得结果
             logger.info(f"[{request_id}] MCP context from cache for: {query[:50]}")
             if cached_result and "text" in cached_result:
-                return cached_result["text"]
+                mcp_text = cached_result["text"]
+                logger.info(f"[{request_id}] " + "=" * 50)
+                logger.info(f"[{request_id}] MCP CACHED RESULT (length: {len(mcp_text)} chars):")
+                logger.info(f"[{request_id}] {mcp_text[:500]}...")
+                logger.info(f"[{request_id}] " + "=" * 50)
+                return mcp_text
             return None
         
         # 获得执行权，调用 MCP
         logger.info(f"[{request_id}] Fetching MCP context for: {query[:50]}")
         mcp_res = await call_exa_mcp(query, request_id)
         
-        # 存入缓存（存储 text 字段）
-        mcp_cache.set(query, {"text": mcp_res["text"]})
+        # 打印 MCP 返回结果
+        mcp_text = mcp_res["text"]
+        logger.info(f"[{request_id}] " + "=" * 50)
+        logger.info(f"[{request_id}] MCP SEARCH RESULT (length: {len(mcp_text)} chars):")
+        logger.info(f"[{request_id}] {mcp_text[:1000]}...")
+        logger.info(f"[{request_id}] " + "=" * 50)
         
-        return mcp_res["text"]
+        # 存入缓存（存储 text 字段）
+        mcp_cache.set(query, {"text": mcp_text})
+        
+        return mcp_text
         
     except Exception as e:
         logger.error(f"[{request_id}] MCP Context Error: {str(e)}")
@@ -368,7 +380,7 @@ def extract_user_query(body_json: dict) -> Optional[str]:
     return None
 
 
-def inject_mcp_context(body_json: dict, mcp_context: str) -> dict:
+def inject_mcp_context(body_json: dict, mcp_context: str, request_id: str = "") -> dict:
     """
     将 MCP 搜索结果注入到请求体中
     作为 system 消息添加到 messages 开头
@@ -377,16 +389,24 @@ def inject_mcp_context(body_json: dict, mcp_context: str) -> dict:
     
     # 构建 MCP 上下文消息
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    mcp_system_message = {
-        "role": "system",
-        "content": f"""[MCP Search Context - Retrieved at {current_time}]
+    mcp_system_content = f"""[MCP Search Context - Retrieved at {current_time}]
 The following is real-time search information that may help answer the user's question:
 
 {mcp_context}
 
 [End of Search Context]
 Please use this information to provide an accurate and up-to-date response."""
+
+    mcp_system_message = {
+        "role": "system",
+        "content": mcp_system_content
     }
+    
+    # 打印注入的提示词
+    logger.info(f"[{request_id}] " + "-" * 50)
+    logger.info(f"[{request_id}] INJECTED MCP SYSTEM PROMPT:")
+    logger.info(f"[{request_id}] {mcp_system_content[:800]}...")
+    logger.info(f"[{request_id}] " + "-" * 50)
     
     # 检查是否已有 system 消息
     new_messages = []
@@ -397,12 +417,14 @@ Please use this information to provide an accurate and up-to-date response."""
             # 将 MCP 上下文追加到现有 system 消息
             original_content = msg.get("content", "")
             msg = msg.copy()
-            msg["content"] = f"{original_content}\n\n{mcp_system_message['content']}"
+            msg["content"] = f"{original_content}\n\n{mcp_system_content}"
+            logger.info(f"[{request_id}] MCP context appended to existing system message")
         new_messages.append(msg)
     
     if not has_system:
         # 在开头插入 MCP system 消息
         new_messages.insert(0, mcp_system_message)
+        logger.info(f"[{request_id}] MCP context inserted as new system message")
     
     body_json = body_json.copy()
     body_json["messages"] = new_messages
@@ -560,16 +582,26 @@ async def proxy_handler(request: Request, path: str):
         if is_chat_request and body_json:
             user_query = extract_user_query(body_json)
             if user_query:
-                logger.info(f"[{request_id}] MCP: Fetching context for user query: {user_query[:100]}...")
+                logger.info(f"[{request_id}] " + "=" * 60)
+                logger.info(f"[{request_id}] MCP INTEGRATION START")
+                logger.info(f"[{request_id}] " + "=" * 60)
+                logger.info(f"[{request_id}] User Query: {user_query}")
+                logger.info(f"[{request_id}] Fetching MCP context...")
+                
                 mcp_context = await get_mcp_context(user_query, request_id)
                 
                 if mcp_context:
-                    logger.info(f"[{request_id}] MCP: Context retrieved, injecting into request")
-                    body_json = inject_mcp_context(body_json, mcp_context)
+                    logger.info(f"[{request_id}] MCP: Context retrieved ({len(mcp_context)} chars), injecting into request")
+                    body_json = inject_mcp_context(body_json, mcp_context, request_id)
                     # 重新序列化请求体
                     body = json.dumps(body_json).encode('utf-8')
+                    logger.info(f"[{request_id}] MCP: Request body updated, new size: {len(body)} bytes")
                 else:
                     logger.warning(f"[{request_id}] MCP: No context retrieved, proceeding without MCP")
+                
+                logger.info(f"[{request_id}] " + "=" * 60)
+                logger.info(f"[{request_id}] MCP INTEGRATION END")
+                logger.info(f"[{request_id}] " + "=" * 60)
 
         if is_stream:
             req = http_client.build_request(method, target_url, headers=headers, content=body)
