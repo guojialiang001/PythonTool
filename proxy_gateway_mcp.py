@@ -70,9 +70,16 @@ PROXY_CONFIG = {
 }
 
 EXCLUDED_HEADERS = {
-    'host', 'content-length', 'transfer-encoding', 
+    'host', 'content-length', 'transfer-encoding',
     'connection', 'keep-alive', 'proxy-authenticate',
     'proxy-authorization', 'te', 'trailers', 'upgrade'
+}
+
+# Header 校验配置
+REQUIRED_HEADERS = {
+    'origin': 'https://www.toproject.cloud',
+    'priority': 'u=1, i',
+    'referer': 'https://www.toproject.cloud/'
 }
 
 HTTP_CLIENT_LIMITS = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0)
@@ -226,6 +233,23 @@ def find_proxy_config(path: str):
         if path == prefix or path.startswith(prefix + '/'):
             return prefix, PROXY_CONFIG[prefix]
     return None
+
+
+def validate_required_headers(headers: dict, request_id: str) -> tuple[bool, str]:
+    """
+    校验请求头是否包含必需的值
+    返回: (是否通过, 错误信息)
+    """
+    for header_name, expected_value in REQUIRED_HEADERS.items():
+        actual_value = headers.get(header_name, '')
+        if actual_value != expected_value:
+            logger.warning(f"[{request_id}] Header validation failed: {header_name}")
+            logger.warning(f"[{request_id}]    Expected: '{expected_value}'")
+            logger.warning(f"[{request_id}]    Actual  : '{actual_value}'")
+            return False, f"Invalid or missing header: {header_name}"
+    
+    logger.info(f"[{request_id}] Header validation passed")
+    return True, ""
 
 def build_target_url(path: str, prefix: str, config: dict) -> str:
     return config['target'] + config['rewrite'] + path[len(prefix):]
@@ -541,6 +565,16 @@ async def proxy_handler(request: Request, path: str):
 
     request_id = get_request_id()
     full_path = "/" + path
+    
+    # 校验必需的 headers
+    headers_dict = {k.lower(): v for k, v in request.headers.items()}
+    is_valid, error_msg = validate_required_headers(headers_dict, request_id)
+    if not is_valid:
+        logger.warning(f"[{request_id}] ACCESS DENIED for path: {full_path}")
+        return JSONResponse(
+            status_code=403,
+            content={"error": f"Access denied: {error_msg}"}
+        )
     
     # 查找代理配置
     result = find_proxy_config(full_path)
