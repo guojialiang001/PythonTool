@@ -10,29 +10,6 @@ import time
 import os
 import re
 from contextlib import asynccontextmanager
-import sys
-
-# 确保当前脚本所在目录在 Python 模块搜索路径中
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-
-# 导入安全模块
-try:
-    from ssh_security import (
-        apply_security_checks,
-        validate_ssh_connection,
-        validate_command_input,
-        cleanup_security_session,
-        rate_limiter,
-        session_security,
-        security_logger,
-        InputValidator
-    )
-except ImportError:
-    print(f"错误: 找不到安全组件 ssh_security.py，请确保该文件位于: {current_dir}")
-    # 提供降级方案或明确报错
-    raise
 
 # SSH连接信息模型
 class SSHConnection(BaseModel):
@@ -644,13 +621,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SSH WebSocket工具", lifespan=lifespan)
 
-# 加载安全中间件
-try:
-    from ssh_security_middleware import apply_security_to_app
-    apply_security_to_app(app)
-except ImportError:
-    print("警告: 无法加载安全中间件 (ssh_security_middleware.py)，将使用基础安全模式运行。")
-
 # 添加CORS中间件
 app.add_middleware(
     CORSMiddleware,
@@ -668,35 +638,11 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
     session_id = None
     ssh_client = None
     channel = None
-    client_ip = None  # 安全：记录客户端IP
     
     try:
-        # === 安全检查：连接前验证 ===
-        allowed, error_msg, client_ip = apply_security_checks(websocket)
-        if not allowed:
-            security_logger.log_blocked(client_ip, error_msg)
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": f"连接被拒绝: {error_msg}"
-            }))
-            return
-        
-        # 安全：添加连接计数
-        rate_limiter.add_conn(client_ip)
-        
         # 接收连接信息
         connection_data = await websocket.receive_text()
-        
-        # === 安全检查：消息大小验证 ===
-        if not InputValidator.validate_msg_size(connection_data):
-            security_logger.log_blocked(client_ip, "消息过大")
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": "消息过大"
-            }))
-            return
-        
-        print(f"[{client_ip}] 接收到连接数据")
+        print(f"接收到连接数据: {connection_data}")
         
         connection_info = json.loads(connection_data)
         
@@ -729,32 +675,15 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
             }))
             return
         
-        # === 安全检查：SSH连接参数验证 ===
-        valid, error, sanitized_data = validate_ssh_connection(connection_info["data"])
-        if not valid:
-            security_logger.log_blocked(client_ip, error)
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": error
-            }))
-            return
-        
-        connection = SSHConnection(**sanitized_data)
+        connection = SSHConnection(**connection_info["data"])
         session_id = app.state.ssh_manager.generate_session_id(connection)
-        
-        # 安全：注册会话
-        session_security.register(session_id, client_ip)
-        
-        print(f"[{client_ip}] 生成会话ID: {session_id}")
+        print(f"生成会话ID: {session_id}")
         
         # 建立SSH连接
-        print(f"[{client_ip}] 正在建立SSH连接: {connection.username}@{connection.hostname}:{connection.port}")
+        print(f"正在建立SSH连接: {connection.username}@{connection.hostname}:{connection.port}")
         ssh_client = app.state.ssh_manager.connect_ssh(connection)
         app.state.ssh_manager.register_websocket(session_id, websocket)
-        
-        # 安全：记录连接成功
-        security_logger.log_connection(client_ip, connection.hostname, connection.username, True)
-        print(f"[{client_ip}] SSH连接成功")
+        print(f"SSH连接成功")
         
         # 创建交互式shell通道，配置终端类型和模式
         channel = ssh_client.invoke_shell(term='xterm', width=connection.width, height=connection.height)
@@ -908,27 +837,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         # 处理客户端消息
         while True:
             try:
-                # === 安全检查：空闲超时检查 ===
-                if session_security.check_idle(session_id):
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "会话空闲超时，连接已断开"
-                    }))
-                    break
-                
                 message_data = await websocket.receive_text()
-                
-                # 安全：更新会话活动时间
-                session_security.update(session_id)
-                
-                # === 安全检查：消息大小验证 ===
-                if not InputValidator.validate_msg_size(message_data):
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "消息过大"
-                    }))
-                    continue
-                
                 message = json.loads(message_data)
                 
                 if message["type"] == "command":
@@ -936,16 +845,6 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                     command = message["data"]["command"]
                     # 移除命令末尾的换行符，避免发送多余的换行导致重复提示符
                     command = command.rstrip('\r\n')
-                    
-                    # === 安全检查：命令验证 ===
-                    valid, error, validated_cmd = validate_command_input(command, session_id)
-                    if not valid:
-                        await websocket.send_text(json.dumps({
-                            "type": "error",
-                            "message": error
-                        }))
-                        continue
-                    command = validated_cmd
 
                     # 先添加命令到历史记录（所有命令都需要记录）
                     app.state.ssh_manager.add_command_to_history(session_id, command)
@@ -1251,14 +1150,6 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                 app.state.ssh_manager.disconnect_ssh(session_id)
             except Exception as e:
                 print(f"断开SSH连接失败: {e}")
-        
-        # === 安全清理：清理会话安全数据 ===
-        if session_id and client_ip:
-            cleanup_security_session(session_id, client_ip)
-        elif client_ip:
-            # 即使没有session_id，也要移除连接计数
-            rate_limiter.remove_conn(client_ip)
-        
         # 尝试关闭WebSocket连接，但处理已关闭的情况
         try:
             await websocket.close()
@@ -1270,41 +1161,15 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
 @app.websocket("/ws/ssh/execute")
 async def websocket_command_endpoint(websocket: WebSocket):
     """
-    WebSocket命令执行端点（单次命令）- 安全增强版
+    WebSocket命令执行端点（单次命令）
     """
     await websocket.accept()
-    
-    client_ip = None  # 安全：记录客户端IP
+    print("WebSocket连接已接受")
     
     try:
-        # === 安全检查：连接前验证 ===
-        allowed, error_msg, client_ip = apply_security_checks(websocket)
-        if not allowed:
-            security_logger.log_blocked(client_ip, error_msg)
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": f"连接被拒绝: {error_msg}"
-            }))
-            return
-        
-        # 安全：添加连接计数
-        rate_limiter.add_conn(client_ip)
-        
-        print(f"[{client_ip}] WebSocket连接已接受")
-        
         # 接收命令信息
         command_data = await websocket.receive_text()
-        
-        # === 安全检查：消息大小验证 ===
-        if not InputValidator.validate_msg_size(command_data):
-            security_logger.log_blocked(client_ip, "消息过大")
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": "消息过大"
-            }))
-            return
-        
-        print(f"[{client_ip}] 接收到命令数据")
+        print(f"接收到命令数据: {command_data}")
         command_info = json.loads(command_data)
         
         if "type" not in command_info or command_info["type"] != "execute":
@@ -1314,37 +1179,13 @@ async def websocket_command_endpoint(websocket: WebSocket):
             }))
             return
         
-        # === 安全检查：SSH连接参数验证 ===
-        valid, error, sanitized_conn = validate_ssh_connection(command_info["data"]["connection"])
-        if not valid:
-            security_logger.log_blocked(client_ip, error)
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": error
-            }))
-            return
-        
-        connection = SSHConnection(**sanitized_conn)
+        connection = SSHConnection(**command_info["data"]["connection"])
         command = command_info["data"]["command"]
         timeout = command_info["data"].get("timeout", 30)
-        
-        # === 安全检查：命令验证 ===
-        session_id = f"execute_{client_ip}_{time.time()}"
-        valid, error, validated_cmd = validate_command_input(command, session_id)
-        if not valid:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": error
-            }))
-            return
-        command = validated_cmd
         
         # 建立SSH连接
         ssh_manager: SSHSessionManager = app.state.ssh_manager
         ssh_client = ssh_manager.connect_ssh(connection)
-        
-        # 安全：记录连接
-        security_logger.log_connection(client_ip, connection.hostname, connection.username, True)
         
         # 执行命令
         stdin, stdout, stderr = ssh_client.exec_command(command, timeout=timeout)
@@ -1389,10 +1230,6 @@ async def websocket_command_endpoint(websocket: WebSocket):
         except Exception as send_error:
             print(f"发送错误消息失败: {send_error}")
     finally:
-        # === 安全清理 ===
-        if client_ip:
-            rate_limiter.remove_conn(client_ip)
-        
         # 尝试关闭WebSocket连接，但处理已关闭的情况
         try:
             await websocket.close()
