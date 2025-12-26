@@ -104,7 +104,7 @@ class PathSecurityConfig:
         r'%0d',             # CR
         r'%0a',             # LF
     ]
-    
+
     # 敏感路径前缀（禁止访问）
     SENSITIVE_PATHS: List[str] = [
         '/etc/',
@@ -132,13 +132,13 @@ class PathSecurityConfig:
         '/wp-config',
         '/web.config',
     ]
-    
+
     # 允许的 URL scheme
     ALLOWED_SCHEMES: List[str] = ['http', 'https']
-    
+
     # 最大路径长度
     MAX_PATH_LENGTH: int = 2048
-    
+
     # 最大 URL 长度
     MAX_URL_LENGTH: int = 4096
 
@@ -146,7 +146,7 @@ class PathSecurityConfig:
 class PathSecurityValidator:
     """
     路径安全验证器
-    
+
     提供多层安全防护：
     1. 路径长度检查
     2. 危险模式检测
@@ -154,7 +154,7 @@ class PathSecurityValidator:
     4. URL 规范化和验证
     5. 路径遍历防护
     """
-    
+
     def __init__(self, config: PathSecurityConfig = None):
         self.config = config or PathSecurityConfig()
         # 预编译正则表达式以提高性能
@@ -163,46 +163,46 @@ class PathSecurityValidator:
             for pattern in self.config.DANGEROUS_PATTERNS
         ]
         logger.info("PathSecurityValidator initialized with enhanced protection")
-    
+
     def validate_path(self, path: str, request_id: str = "") -> Tuple[bool, str]:
         """
         验证请求路径的安全性
-        
+
         Args:
             path: 请求路径
             request_id: 请求 ID（用于日志）
-        
+
         Returns:
             (is_valid, error_message) - 如果有效返回 (True, "")，否则返回 (False, 错误信息)
         """
         if not path:
             return False, "Empty path is not allowed"
-        
+
         # 1. 检查路径长度
         if len(path) > self.config.MAX_PATH_LENGTH:
             logger.warning(f"[{request_id}] SECURITY: Path too long ({len(path)} > {self.config.MAX_PATH_LENGTH})")
             return False, f"Path exceeds maximum length of {self.config.MAX_PATH_LENGTH}"
-        
+
         # 2. URL 解码并检查（防止编码绕过）
         try:
             decoded_path = unquote(unquote(path))  # 双重解码以防止双重编码攻击
         except Exception as e:
             logger.warning(f"[{request_id}] SECURITY: Path decode error: {str(e)}")
             return False, "Invalid path encoding"
-        
+
         # 3. 检查危险模式
         for pattern in self._dangerous_patterns:
             if pattern.search(path) or pattern.search(decoded_path):
                 logger.warning(f"[{request_id}] SECURITY: Dangerous pattern detected in path: {path[:100]}")
                 return False, "Path contains dangerous patterns"
-        
+
         # 4. 检查敏感路径
         path_lower = decoded_path.lower()
         for sensitive in self.config.SENSITIVE_PATHS:
             if path_lower.startswith(sensitive.lower()) or sensitive.lower() in path_lower:
                 logger.warning(f"[{request_id}] SECURITY: Sensitive path access attempt: {path[:100]}")
                 return False, "Access to sensitive path is forbidden"
-        
+
         # 5. 规范化路径并检查路径遍历
         normalized = self._normalize_path(decoded_path)
         if normalized != decoded_path.replace('\\', '/'):
@@ -210,75 +210,75 @@ class PathSecurityValidator:
             if '..' in path or '..' in decoded_path:
                 logger.warning(f"[{request_id}] SECURITY: Path traversal attempt detected: {path[:100]}")
                 return False, "Path traversal is not allowed"
-        
+
         # 6. 检查是否包含 null 字节
         if '\x00' in path or '\x00' in decoded_path:
             logger.warning(f"[{request_id}] SECURITY: Null byte injection attempt: {path[:100]}")
             return False, "Null byte in path is not allowed"
-        
+
         return True, ""
-    
+
     def validate_url(self, url: str, request_id: str = "") -> Tuple[bool, str]:
         """
         验证目标 URL 的安全性
-        
+
         Args:
             url: 目标 URL
             request_id: 请求 ID
-        
+
         Returns:
             (is_valid, error_message)
         """
         if not url:
             return False, "Empty URL is not allowed"
-        
+
         # 1. 检查 URL 长度
         if len(url) > self.config.MAX_URL_LENGTH:
             logger.warning(f"[{request_id}] SECURITY: URL too long ({len(url)} > {self.config.MAX_URL_LENGTH})")
             return False, f"URL exceeds maximum length of {self.config.MAX_URL_LENGTH}"
-        
+
         # 2. 解析 URL
         try:
             parsed = urlparse(url)
         except Exception as e:
             logger.warning(f"[{request_id}] SECURITY: URL parse error: {str(e)}")
             return False, "Invalid URL format"
-        
+
         # 3. 检查 scheme
         if parsed.scheme.lower() not in self.config.ALLOWED_SCHEMES:
             logger.warning(f"[{request_id}] SECURITY: Invalid URL scheme: {parsed.scheme}")
             return False, f"URL scheme '{parsed.scheme}' is not allowed"
-        
+
         # 4. 检查是否有主机名
         if not parsed.netloc:
             logger.warning(f"[{request_id}] SECURITY: URL missing host: {url[:100]}")
             return False, "URL must have a valid host"
-        
+
         # 5. 检查是否是内网地址（防止 SSRF）
         is_internal, reason = self._check_internal_address(parsed.netloc, request_id)
         if is_internal:
             logger.warning(f"[{request_id}] SECURITY: Internal address access attempt: {parsed.netloc}")
             return False, reason
-        
+
         # 6. 验证路径部分
         if parsed.path:
             path_valid, path_error = self.validate_path(parsed.path, request_id)
             if not path_valid:
                 return False, f"URL path validation failed: {path_error}"
-        
+
         return True, ""
-    
+
     def _normalize_path(self, path: str) -> str:
         """
         规范化路径，移除冗余的 . 和 ..
         """
         # 将反斜杠转换为正斜杠
         path = path.replace('\\', '/')
-        
+
         # 分割路径
         parts = path.split('/')
         normalized = []
-        
+
         for part in parts:
             if part == '..':
                 if normalized and normalized[-1] != '':
@@ -287,29 +287,29 @@ class PathSecurityValidator:
                 normalized.append(part)
             elif part == '' and not normalized:
                 normalized.append('')
-        
+
         result = '/'.join(normalized)
         if path.startswith('/') and not result.startswith('/'):
             result = '/' + result
-        
+
         return result
-    
+
     def _check_internal_address(self, host: str, request_id: str = "") -> Tuple[bool, str]:
         """
         检查是否是内网地址（防止 SSRF 攻击）
-        
+
         注意：这里只做基本检查，生产环境应该使用更严格的检查
         """
         host_lower = host.lower()
-        
+
         # 移除端口号
         if ':' in host_lower:
             host_lower = host_lower.split(':')[0]
-        
+
         # 检查 localhost
         if host_lower in ['localhost', '127.0.0.1', '::1', '0.0.0.0']:
             return True, "Access to localhost is forbidden"
-        
+
         # 检查内网 IP 范围
         internal_patterns = [
             r'^10\.',                    # 10.0.0.0/8
@@ -319,27 +319,27 @@ class PathSecurityValidator:
             r'^fc00:',                   # IPv6 私有地址
             r'^fe80:',                   # IPv6 链路本地
         ]
-        
+
         for pattern in internal_patterns:
             if re.match(pattern, host_lower, re.IGNORECASE):
                 return True, "Access to internal network is forbidden"
-        
+
         # 检查是否是 metadata 服务（云环境）
         metadata_hosts = [
             '169.254.169.254',           # AWS/GCP/Azure metadata
             'metadata.google.internal',   # GCP
             'metadata.azure.com',         # Azure
         ]
-        
+
         if host_lower in metadata_hosts:
             return True, "Access to cloud metadata service is forbidden"
-        
+
         return False, ""
-    
+
     def sanitize_path(self, path: str) -> str:
         """
         清理和规范化路径
-        
+
         Returns:
             清理后的安全路径
         """
@@ -348,17 +348,17 @@ class PathSecurityValidator:
             path = unquote(path)
         except:
             pass
-        
+
         # 移除 null 字节
         path = path.replace('\x00', '')
-        
+
         # 规范化
         path = self._normalize_path(path)
-        
+
         # 确保以 / 开头
         if not path.startswith('/'):
             path = '/' + path
-        
+
         return path
 
 
@@ -370,17 +370,17 @@ path_security = PathSecurityValidator()
 class SecurityStats:
     """
     安全事件统计和记录
-    
+
     功能：
     1. 统计各类安全事件数量
     2. 记录最近的安全事件详情
     3. 线程安全的计数器
     """
-    
+
     def __init__(self, max_events: int = 1000):
         self.lock = threading.Lock()
         self.max_events = max_events
-        
+
         # 统计计数器
         self.blocked_count = 0
         self.path_traversal_count = 0
@@ -389,15 +389,15 @@ class SecurityStats:
         self.sensitive_path_count = 0
         self.dangerous_pattern_count = 0
         self.rate_limit_count = 0  # 速率限制计数
-        
+
         # 最近的安全事件列表
         self._recent_events: List[Dict[str, Any]] = []
-    
+
     def record_event(self, event_type: str, request_id: str, path: str,
                      detail: str = "", client_ip: str = ""):
         """
         记录安全事件
-        
+
         Args:
             event_type: 事件类型 (path_traversal, ssrf, invalid_path, sensitive_path, dangerous_pattern, rate_limit)
             request_id: 请求 ID
@@ -408,7 +408,7 @@ class SecurityStats:
         with self.lock:
             # 更新计数器
             self.blocked_count += 1
-            
+
             if event_type == "path_traversal":
                 self.path_traversal_count += 1
             elif event_type == "ssrf":
@@ -421,7 +421,7 @@ class SecurityStats:
                 self.dangerous_pattern_count += 1
             elif event_type == "rate_limit":
                 self.rate_limit_count += 1
-            
+
             # 记录事件详情
             event = {
                 "timestamp": datetime.now().isoformat(),
@@ -431,30 +431,30 @@ class SecurityStats:
                 "detail": detail[:500] if detail else "",  # 截断过长的详情
                 "client_ip": client_ip
             }
-            
+
             self._recent_events.append(event)
-            
+
             # 保持列表大小在限制内
             if len(self._recent_events) > self.max_events:
                 self._recent_events = self._recent_events[-self.max_events:]
-            
+
             # 记录到日志
             logger.warning(f"[SECURITY EVENT] Type: {event_type} | Request: {request_id} | "
                           f"Path: {path[:100]} | Detail: {detail[:100]}")
-    
+
     def get_recent_events(self, limit: int = 50) -> List[Dict[str, Any]]:
         """
         获取最近的安全事件
-        
+
         Args:
             limit: 返回的最大事件数量
-        
+
         Returns:
             最近的安全事件列表（按时间倒序）
         """
         with self.lock:
             return list(reversed(self._recent_events[-limit:]))
-    
+
     def get_summary(self) -> Dict[str, Any]:
         """
         获取安全统计摘要
@@ -479,40 +479,40 @@ security_stats = SecurityStats()
 class RateLimiterConfig:
     """
     速率限制配置
-    
+
     设计原则：只封禁明显的恶意攻击，正常用户几乎不可能触发
-    
+
     正常使用场景分析：
     - 前端默认 12 并发 + 2 个总结模型 = 14 并发
     - 每个对话请求约 1-5 秒完成
     - 正常用户每分钟最多 100-200 请求
     - 即使疯狂点击，人类也很难超过每秒 10 个请求
-    
+
     攻击场景：
     - 脚本攻击通常每秒数百甚至数千请求
     - 设置阈值为每秒 200 请求，这是人类绝对不可能达到的速率
     """
     # 时间窗口（秒）
     WINDOW_SIZE: int = 60
-    
+
     # 每个时间窗口内允许的最大请求数
     # 设置为 2000，即每分钟 2000 请求，正常用户不可能达到
     MAX_REQUESTS_PER_WINDOW: int = 2000
-    
+
     # 触发封禁的阈值（每秒请求数）
     # 设置为 200 rps，这是人类绝对不可能达到的速率
     # 即使用脚本，200 rps 也是明显的攻击行为
     BAN_THRESHOLD_RPS: int = 200
-    
+
     # 封禁持续时间（秒）
     BAN_DURATION: int = 600  # 10 分钟
-    
+
     # 永久封禁阈值（被临时封禁的次数）
     PERMANENT_BAN_THRESHOLD: int = 3
-    
+
     # 清理过期记录的间隔（秒）
     CLEANUP_INTERVAL: int = 60
-    
+
     # 突发请求容忍度（1秒内的请求峰值）
     # 设置为 100，即 1 秒内 100 个请求才触发警告
     BURST_LIMIT: int = 100
@@ -521,31 +521,31 @@ class RateLimiterConfig:
 class RateLimiter:
     """
     速率限制器 - 带自动封禁功能
-    
+
     功能：
     1. 滑动窗口速率限制
     2. 超速自动临时封禁
     3. 多次违规永久封禁
     4. 线程安全
     5. 自动清理过期记录
-    
+
     工作原理：
     - 每个 IP 维护一个请求时间戳列表
     - 计算滑动窗口内的请求数
     - 如果请求速率超过阈值，自动封禁
     - 多次被封禁后，永久封禁
     """
-    
+
     def __init__(self, config: RateLimiterConfig = None):
         self.config = config or RateLimiterConfig()
         self.lock = threading.Lock()
-        
+
         # IP -> 请求时间戳列表
         self._requests: Dict[str, List[float]] = {}
-        
+
         # IP -> 封禁信息 {banned_until: float, ban_count: int, permanent: bool}
         self._bans: Dict[str, Dict[str, Any]] = {}
-        
+
         # 统计信息
         self._stats = {
             "total_requests": 0,
@@ -553,43 +553,43 @@ class RateLimiter:
             "temp_bans": 0,
             "permanent_bans": 0
         }
-        
+
         # 上次清理时间
         self._last_cleanup = time.time()
-        
+
         logger.info(f"RateLimiter initialized: {self.config.MAX_REQUESTS_PER_WINDOW} req/{self.config.WINDOW_SIZE}s, "
                    f"ban threshold: {self.config.BAN_THRESHOLD_RPS} rps")
-    
+
     def is_allowed(self, client_ip: str, request_id: str = "") -> Tuple[bool, str]:
         """
         检查请求是否被允许
-        
+
         Args:
             client_ip: 客户端 IP
             request_id: 请求 ID（用于日志）
-        
+
         Returns:
             (is_allowed, reason) - 如果允许返回 (True, "")，否则返回 (False, 原因)
         """
         current_time = time.time()
-        
+
         with self.lock:
             self._stats["total_requests"] += 1
-            
+
             # 定期清理过期记录
             if current_time - self._last_cleanup > self.config.CLEANUP_INTERVAL:
                 self._cleanup_expired(current_time)
                 self._last_cleanup = current_time
-            
+
             # 1. 检查是否被封禁
             if client_ip in self._bans:
                 ban_info = self._bans[client_ip]
-                
+
                 # 永久封禁
                 if ban_info.get("permanent", False):
                     logger.warning(f"[{request_id}] RATE LIMIT: Permanently banned IP: {client_ip}")
                     return False, "IP is permanently banned due to repeated violations"
-                
+
                 # 临时封禁
                 if current_time < ban_info.get("banned_until", 0):
                     remaining = int(ban_info["banned_until"] - current_time)
@@ -598,54 +598,54 @@ class RateLimiter:
                 else:
                     # 封禁已过期，但保留 ban_count
                     pass
-            
+
             # 2. 获取或创建请求记录
             if client_ip not in self._requests:
                 self._requests[client_ip] = []
-            
+
             requests = self._requests[client_ip]
-            
+
             # 3. 清理窗口外的旧请求
             window_start = current_time - self.config.WINDOW_SIZE
             requests[:] = [t for t in requests if t > window_start]
-            
+
             # 4. 计算当前速率
             request_count = len(requests)
-            
+
             # 5. 检查是否超过速率限制
             if request_count >= self.config.MAX_REQUESTS_PER_WINDOW:
                 self._stats["rate_limited"] += 1
-                
+
                 # 计算每秒请求数
                 if request_count > 0:
                     time_span = current_time - requests[0] if requests else 1
                     rps = request_count / max(time_span, 1)
-                    
+
                     # 如果速率极高，触发封禁
                     if rps >= self.config.BAN_THRESHOLD_RPS:
                         self._ban_ip(client_ip, current_time, request_id)
                         return False, f"IP banned due to excessive request rate ({rps:.1f} rps)"
-                
+
                 logger.warning(f"[{request_id}] RATE LIMIT: {client_ip} exceeded limit: {request_count}/{self.config.MAX_REQUESTS_PER_WINDOW}")
                 return False, f"Rate limit exceeded. Maximum {self.config.MAX_REQUESTS_PER_WINDOW} requests per {self.config.WINDOW_SIZE} seconds"
-            
+
             # 6. 记录本次请求
             requests.append(current_time)
-            
+
             return True, ""
-    
+
     def _ban_ip(self, client_ip: str, current_time: float, request_id: str = ""):
         """
         封禁 IP
-        
+
         内部方法，必须在持有锁的情况下调用
         """
         if client_ip not in self._bans:
             self._bans[client_ip] = {"ban_count": 0, "permanent": False}
-        
+
         ban_info = self._bans[client_ip]
         ban_info["ban_count"] = ban_info.get("ban_count", 0) + 1
-        
+
         # 检查是否达到永久封禁阈值
         if ban_info["ban_count"] >= self.config.PERMANENT_BAN_THRESHOLD:
             ban_info["permanent"] = True
@@ -658,35 +658,35 @@ class RateLimiter:
             self._stats["temp_bans"] += 1
             logger.error(f"[{request_id}] RATE LIMIT: IP {client_ip} TEMPORARILY BANNED for {ban_duration}s "
                         f"(violation #{ban_info['ban_count']})")
-    
+
     def _cleanup_expired(self, current_time: float):
         """
         清理过期的请求记录
-        
+
         内部方法，必须在持有锁的情况下调用
         """
         window_start = current_time - self.config.WINDOW_SIZE
-        
+
         # 清理过期的请求记录
         expired_ips = []
         for ip, requests in self._requests.items():
             requests[:] = [t for t in requests if t > window_start]
             if not requests:
                 expired_ips.append(ip)
-        
+
         for ip in expired_ips:
             del self._requests[ip]
-        
+
         if expired_ips:
             logger.debug(f"RateLimiter cleanup: removed {len(expired_ips)} inactive IPs")
-    
+
     def unban_ip(self, client_ip: str) -> bool:
         """
         手动解除 IP 封禁
-        
+
         Args:
             client_ip: 要解封的 IP
-        
+
         Returns:
             是否成功解封
         """
@@ -696,7 +696,7 @@ class RateLimiter:
                 logger.info(f"IP {client_ip} has been unbanned")
                 return True
             return False
-    
+
     def get_ban_info(self, client_ip: str) -> Optional[Dict[str, Any]]:
         """
         获取 IP 的封禁信息
@@ -705,7 +705,7 @@ class RateLimiter:
             if client_ip in self._bans:
                 return self._bans[client_ip].copy()
             return None
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """
         获取速率限制统计信息
@@ -717,7 +717,7 @@ class RateLimiter:
                 "banned_ips": len([b for b in self._bans.values() if b.get("permanent") or time.time() < b.get("banned_until", 0)]),
                 "permanent_banned_ips": len([b for b in self._bans.values() if b.get("permanent")])
             }
-    
+
     def get_banned_ips(self) -> List[Dict[str, Any]]:
         """
         获取所有被封禁的 IP 列表
@@ -739,6 +739,13 @@ class RateLimiter:
 # 创建全局速率限制器实例
 rate_limiter = RateLimiter()
 
+
+# Header 校验配置
+REQUIRED_HEADERS = {
+    'origin': 'https://www.toproject.cloud',
+    'priority': 'u=1, i',
+    'referer': 'https://www.toproject.cloud/'
+}
 
 HTTP_CLIENT_LIMITS = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0)
 http_client: Optional[httpx.AsyncClient] = None
@@ -889,37 +896,56 @@ async def shutdown_event():
 def find_proxy_config(path: str, request_id: str = "") -> Optional[Tuple[str, dict]]:
     """
     查找匹配的代理配置
-    
+
     增强安全性：
     1. 严格匹配白名单路径
     2. 防止路径混淆攻击
     """
     # 规范化路径
     normalized_path = path_security.sanitize_path(path)
-    
+
     for prefix in sorted(PROXY_CONFIG.keys(), key=len, reverse=True):
         if normalized_path == prefix or normalized_path.startswith(prefix + '/'):
             logger.debug(f"[{request_id}] Proxy config matched: {prefix} for path: {normalized_path}")
             return prefix, PROXY_CONFIG[prefix]
-    
+
     logger.debug(f"[{request_id}] No proxy config found for path: {normalized_path}")
     return None
 
 
+def validate_required_headers(headers: dict, request_id: str) -> tuple[bool, str]:
+    """
+    校验请求头是否包含必需的值
+    返回: (是否通过, 错误信息)
+    """
+    for header_name, expected_value in REQUIRED_HEADERS.items():
+        actual_value = headers.get(header_name, '')
+        if actual_value != expected_value:
+            logger.warning(f"[{request_id}] Header validation failed: {header_name}")
+            logger.warning(f"[{request_id}]    Expected: '{expected_value}'")
+            logger.warning(f"[{request_id}]    Actual  : '{actual_value}'")
+            return False, f"Invalid or missing header: {header_name}"
+
+    logger.info(f"[{request_id}] Header validation passed")
+    return True, ""
+
+def build_target_url(path: str, prefix: str, config: dict) -> str:
+    return config['target'] + config['rewrite'] + path[len(prefix):]
+
 def build_target_url(path: str, prefix: str, config: dict, request_id: str = "") -> Tuple[str, bool, str]:
     """
     构建目标 URL
-    
+
     Returns:
         (url, is_valid, error_message)
     """
     # 构建基础 URL
     remaining_path = path[len(prefix):]
     target_url = config['target'] + config['rewrite'] + remaining_path
-    
+
     # 验证目标 URL 安全性
     is_valid, error = path_security.validate_url(target_url, request_id)
-    
+
     return target_url, is_valid, error
 
 def filter_headers(headers: dict) -> dict:
@@ -1227,7 +1253,7 @@ async def stream_response(response: httpx.Response, request_id: str, start_time:
 def get_client_ip(request: Request) -> str:
     """
     获取客户端真实 IP 地址
-    
+
     支持代理头：X-Forwarded-For, X-Real-IP
     """
     # 检查 X-Forwarded-For 头（可能包含多个 IP，取第一个）
@@ -1235,16 +1261,16 @@ def get_client_ip(request: Request) -> str:
     if forwarded_for:
         # 格式: client, proxy1, proxy2
         return forwarded_for.split(",")[0].strip()
-    
+
     # 检查 X-Real-IP 头
     real_ip = request.headers.get("x-real-ip")
     if real_ip:
         return real_ip.strip()
-    
+
     # 使用直接连接的客户端 IP
     if request.client:
         return request.client.host
-    
+
     return "unknown"
 
 
@@ -1253,7 +1279,7 @@ def determine_security_event_type(error_message: str) -> str:
     根据错误信息确定安全事件类型
     """
     error_lower = error_message.lower()
-    
+
     if "traversal" in error_lower or ".." in error_lower:
         return "path_traversal"
     elif "internal" in error_lower or "localhost" in error_lower or "ssrf" in error_lower or "metadata" in error_lower:
@@ -1270,7 +1296,7 @@ def determine_security_event_type(error_message: str) -> str:
 async def proxy_handler(request: Request, path: str):
     """
     代理处理器 - 带增强路径安全防护和速率限制
-    
+
     安全措施：
     1. 速率限制 - 防止 DDoS 和暴力攻击
     2. 路径验证 - 检查危险模式和敏感路径
@@ -1282,7 +1308,7 @@ async def proxy_handler(request: Request, path: str):
     """
     request_id = get_request_id()
     client_ip = get_client_ip(request)
-    
+
     # 排除已定义的特定路由（这些路由不受速率限制）
     # 注意：这些路由通常由 FastAPI 优先匹配到特定的 handler，
     # 但如果请求方法不匹配（例如对 /health 发送 POST 请求），则会回退到此通配符路由。
@@ -1292,6 +1318,18 @@ async def proxy_handler(request: Request, path: str):
 
     full_path = "/" + path
     
+    # 校验必需的 headers
+    headers_dict = {k.lower(): v for k, v in request.headers.items()}
+    is_valid, error_msg = validate_required_headers(headers_dict, request_id)
+    if not is_valid:
+        logger.warning(f"[{request_id}] ACCESS DENIED for path: {full_path}")
+        return JSONResponse(
+            status_code=403,
+            content={"error": f"Access denied: {error_msg}"}
+        )
+
+    # 查找代理配置
+    result = find_proxy_config(full_path)
     # === 安全检查 0: 速率限制检查 ===
     rate_allowed, rate_error = rate_limiter.is_allowed(client_ip, request_id)
     if not rate_allowed:
@@ -1303,7 +1341,7 @@ async def proxy_handler(request: Request, path: str):
             detail=rate_error,
             client_ip=client_ip
         )
-        
+
         logger.warning(f"[{request_id}] RATE LIMITED: {rate_error} | Path: {full_path[:100]} | IP: {client_ip}")
         return JSONResponse(
             status_code=429,  # Too Many Requests
@@ -1318,7 +1356,7 @@ async def proxy_handler(request: Request, path: str):
                 "X-RateLimit-Window": str(RateLimiterConfig.WINDOW_SIZE)
             }
         )
-    
+
     # === 安全检查 1: 验证请求路径 ===
     path_valid, path_error = path_security.validate_path(full_path, request_id)
     if not path_valid:
@@ -1331,7 +1369,7 @@ async def proxy_handler(request: Request, path: str):
             detail=path_error,
             client_ip=client_ip
         )
-        
+
         logger.warning(f"[{request_id}] SECURITY BLOCKED: {path_error} | Path: {full_path[:100]} | IP: {client_ip}")
         return JSONResponse(
             status_code=400,
@@ -1341,7 +1379,7 @@ async def proxy_handler(request: Request, path: str):
                 "request_id": request_id
             }
         )
-    
+
     # === 安全检查 2: 查找代理配置（白名单验证） ===
     result = find_proxy_config(full_path, request_id)
     if result is None:
@@ -1355,7 +1393,7 @@ async def proxy_handler(request: Request, path: str):
         )
     
     prefix, config = result
-    
+
     # === 安全检查 3: 构建并验证目标 URL ===
     target_url, url_valid, url_error = build_target_url(full_path, prefix, config, request_id)
     if not url_valid:
@@ -1368,7 +1406,7 @@ async def proxy_handler(request: Request, path: str):
             detail=f"Target URL validation failed: {url_error}",
             client_ip=client_ip
         )
-        
+
         logger.warning(f"[{request_id}] SECURITY BLOCKED: {url_error} | Target: {target_url[:100]} | IP: {client_ip}")
         return JSONResponse(
             status_code=400,
@@ -1563,7 +1601,7 @@ async def get_banned_ips():
 async def unban_ip(ip: str):
     """
     手动解封 IP
-    
+
     Args:
         ip: 要解封的 IP 地址
     """
