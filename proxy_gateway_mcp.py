@@ -75,7 +75,9 @@ PROXY_CONFIG = {
     '/api/minimaxm21': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'},
     '/api/code-relay': {'target': 'https://api.code-relay.com', 'rewrite': '/v1'},
     '/api/qwen': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'},
-    '/api/deepseekv32': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'}
+    '/api/deepseekv32': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'},
+    '/api/Qwen3VL32B': {'target': 'https://api.suanli.cn', 'rewrite': '/v1'},
+    '/api/Qwen330BA3B': {'target': 'https://api.suanli.cn', 'rewrite': '/v1'}
 }
 
 EXCLUDED_HEADERS = {
