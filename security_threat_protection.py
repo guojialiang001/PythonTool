@@ -209,6 +209,23 @@ class ThreatProtectionConfig:
             r'^/proc/',
             r'^/var/log',
             r'^/windows/system32',
+            # Cisco VPN/AnyConnect 扫描路径
+            r'^/\+CSCOE\+',      # Cisco SSL VPN
+            r'^/\+CSCOL\+',      # Cisco SSL VPN
+            r'^/\+CSCOT\+',      # Cisco SSL VPN
+            r'^/\+CSCOW\+',      # Cisco SSL VPN
+            r'^/CSCOE',
+            r'^/webvpn',
+            r'^/dana-na',        # Juniper/Pulse VPN
+            r'^/remote',
+            r'^/vpn',
+            r'^/sslvpn',
+            # 其他常见扫描路径
+            r'^/favicon\.ico$',  # 单独请求 favicon 可能是扫描
+            r'^/robots\.txt$',   # 单独请求 robots.txt 可能是扫描
+            r'^/sitemap\.xml$',
+            r'^/crossdomain\.xml$',
+            r'^/clientaccesspolicy\.xml$',
         ]
         
         # 危险模式（路径遍历、注入等）
@@ -914,6 +931,42 @@ class ThreatProtectionEngine:
             logger.info(f"IP {ip} downgraded from {old_level.name} to {new_level.name}: {reason}")
     
     # === 管理接口 ===
+    
+    def record_violation(self, ip: str, path: str, method: str = "GET",
+                         user_agent: str = "", violation_type: ViolationType = ViolationType.UNKNOWN,
+                         detail: str = "", request_id: str = "") -> Tuple[bool, ThreatLevel]:
+        """
+        公开的违规记录方法，供外部调用
+        
+        当外部检测到违规行为（如 header validation 失败）时，
+        可以调用此方法记录违规并可能升级威胁级别。
+        
+        Args:
+            ip: 客户端 IP
+            path: 请求路径
+            method: HTTP 方法
+            user_agent: User-Agent
+            violation_type: 违规类型
+            detail: 详细描述
+            request_id: 请求 ID
+        
+        Returns:
+            (is_blocked, threat_level)
+            - is_blocked: True 表示 IP 已被加入黑名单
+            - threat_level: 当前威胁级别
+        """
+        # 记录违规
+        self._record_violation(ip, path, method, user_agent, violation_type, detail, request_id)
+        
+        # 获取更新后的记录
+        record = self.storage.get_ip_record(ip)
+        current_level = ThreatLevel(record.level) if record else ThreatLevel.NONE
+        
+        is_blocked = current_level == ThreatLevel.BLACKLIST
+        
+        logger.info(f"[{request_id}] VIOLATION RECORDED: IP {ip}, level={current_level.name}, type={violation_type.value}")
+        
+        return is_blocked, current_level
     
     def manual_blacklist(self, ip: str, reason: str, permanent: bool = False) -> bool:
         """手动将 IP 加入黑名单"""

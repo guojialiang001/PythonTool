@@ -37,7 +37,8 @@ try:
     from security_threat_protection import (
         ThreatProtectionEngine,
         ThreatProtectionConfig,
-        ThreatLevel
+        ThreatLevel,
+        ViolationType
     )
     THREAT_PROTECTION_AVAILABLE = True
 except ImportError:
@@ -45,6 +46,7 @@ except ImportError:
     ThreatProtectionEngine = None
     ThreatProtectionConfig = None
     ThreatLevel = None
+    ViolationType = None
 
 # 日志配置
 logging.basicConfig(
@@ -1417,6 +1419,35 @@ async def proxy_handler(request: Request, path: str):
     is_valid, error_msg = validate_required_headers(headers_dict, request_id)
     if not is_valid:
         logger.warning(f"[{request_id}] ACCESS DENIED for path: {full_path}")
+        
+        # 记录到三级威胁防护系统
+        if threat_engine is not None and ViolationType is not None:
+            is_blocked, current_level = threat_engine.record_violation(
+                ip=client_ip,
+                path=full_path,
+                method=request.method,
+                user_agent=user_agent,
+                violation_type=ViolationType.ABNORMAL_PATH,
+                detail=f"Header validation failed: {error_msg}",
+                request_id=request_id
+            )
+            logger.warning(f"[{request_id}] THREAT RECORDED: IP {client_ip} | Level: {current_level.name} | Blocked: {is_blocked}")
+            
+            # 如果已被加入黑名单，返回更严重的错误
+            if is_blocked:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "Access denied",
+                        "detail": "IP is blacklisted due to repeated violations",
+                        "threat_level": current_level.name,
+                        "request_id": request_id
+                    },
+                    headers={
+                        "X-Threat-Level": current_level.name
+                    }
+                )
+        
         return JSONResponse(
             status_code=403,
             content={"error": f"Access denied: {error_msg}"}
@@ -1463,6 +1494,28 @@ async def proxy_handler(request: Request, path: str):
             detail=path_error,
             client_ip=client_ip
         )
+        
+        # 记录到三级威胁防护系统
+        if threat_engine is not None and ViolationType is not None:
+            # 根据错误类型选择违规类型
+            violation_type = ViolationType.ABNORMAL_PATH
+            if "traversal" in path_error.lower():
+                violation_type = ViolationType.PATH_TRAVERSAL
+            elif "sensitive" in path_error.lower():
+                violation_type = ViolationType.SENSITIVE_ACCESS
+            elif "dangerous" in path_error.lower() or "pattern" in path_error.lower():
+                violation_type = ViolationType.INJECTION_ATTEMPT
+            
+            is_blocked, current_level = threat_engine.record_violation(
+                ip=client_ip,
+                path=full_path,
+                method=request.method,
+                user_agent=user_agent,
+                violation_type=violation_type,
+                detail=f"Path validation failed: {path_error}",
+                request_id=request_id
+            )
+            logger.warning(f"[{request_id}] THREAT RECORDED: IP {client_ip} | Level: {current_level.name} | Type: {violation_type.value}")
 
         logger.warning(f"[{request_id}] SECURITY BLOCKED: {path_error} | Path: {full_path[:100]} | IP: {client_ip}")
         return JSONResponse(
@@ -1477,6 +1530,34 @@ async def proxy_handler(request: Request, path: str):
     # === 安全检查 2: 查找代理配置（白名单验证） ===
     result = find_proxy_config(full_path, request_id)
     if result is None:
+        # 记录到三级威胁防护系统（访问未配置的路径可能是扫描行为）
+        if threat_engine is not None and ViolationType is not None:
+            is_blocked, current_level = threat_engine.record_violation(
+                ip=client_ip,
+                path=full_path,
+                method=request.method,
+                user_agent=user_agent,
+                violation_type=ViolationType.ABNORMAL_PATH,
+                detail=f"Access to unconfigured path: {full_path[:200]}",
+                request_id=request_id
+            )
+            logger.warning(f"[{request_id}] THREAT RECORDED: IP {client_ip} | Level: {current_level.name} | Path not in whitelist")
+            
+            # 如果已被加入黑名单，返回 403
+            if is_blocked:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "Access denied",
+                        "detail": "IP is blacklisted due to repeated violations",
+                        "threat_level": current_level.name,
+                        "request_id": request_id
+                    },
+                    headers={
+                        "X-Threat-Level": current_level.name
+                    }
+                )
+        
         logger.info(f"[{request_id}] No proxy config for path: {full_path[:100]} | IP: {client_ip}")
         return JSONResponse(
             status_code=404,
@@ -1500,6 +1581,26 @@ async def proxy_handler(request: Request, path: str):
             detail=f"Target URL validation failed: {url_error}",
             client_ip=client_ip
         )
+        
+        # 记录到三级威胁防护系统
+        if threat_engine is not None and ViolationType is not None:
+            # 根据错误类型选择违规类型
+            violation_type = ViolationType.ABNORMAL_PATH
+            if "internal" in url_error.lower() or "localhost" in url_error.lower() or "metadata" in url_error.lower():
+                violation_type = ViolationType.INJECTION_ATTEMPT  # SSRF 尝试
+            elif "traversal" in url_error.lower():
+                violation_type = ViolationType.PATH_TRAVERSAL
+            
+            is_blocked, current_level = threat_engine.record_violation(
+                ip=client_ip,
+                path=full_path,
+                method=request.method,
+                user_agent=user_agent,
+                violation_type=violation_type,
+                detail=f"URL validation failed: {url_error}",
+                request_id=request_id
+            )
+            logger.warning(f"[{request_id}] THREAT RECORDED: IP {client_ip} | Level: {current_level.name} | Type: {violation_type.value}")
 
         logger.warning(f"[{request_id}] SECURITY BLOCKED: {url_error} | Target: {target_url[:100]} | IP: {client_ip}")
         return JSONResponse(
