@@ -11,6 +11,7 @@ OpenAI API 代理网关 + Exa MCP 集成版
 - 白名单路径验证
 - 请求路径规范化
 - 敏感路径保护
+- 三级威胁防护系统（观察名单 -> 预警名单 -> 黑名单）
 """
 
 import asyncio
@@ -31,6 +32,20 @@ import time
 import json
 from datetime import datetime
 
+# 导入三级威胁防护系统
+try:
+    from security_threat_protection import (
+        ThreatProtectionEngine,
+        ThreatProtectionConfig,
+        ThreatLevel
+    )
+    THREAT_PROTECTION_AVAILABLE = True
+except ImportError:
+    THREAT_PROTECTION_AVAILABLE = False
+    ThreatProtectionEngine = None
+    ThreatProtectionConfig = None
+    ThreatLevel = None
+
 # 日志配置
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +54,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="OpenAI API Proxy Gateway with MCP")
+app = FastAPI(title="OpenAI API Proxy Gateway with MCP + Threat Protection")
+
+# ============================================================
+# 三级威胁防护系统初始化
+# ============================================================
+threat_engine: Optional[ThreatProtectionEngine] = None
+
+def init_threat_protection():
+    """初始化三级威胁防护系统"""
+    global threat_engine
+    
+    if not THREAT_PROTECTION_AVAILABLE:
+        logger.warning("ThreatProtection module not available, skipping initialization")
+        return
+    
+    try:
+        config = ThreatProtectionConfig()
+        
+        # 配置白名单路径（这些路径不会触发威胁检测）
+        # 添加所有代理配置的路径前缀
+        for path_prefix in PROXY_CONFIG.keys():
+            config.add_whitelist_path(path_prefix)
+        
+        # 添加系统路径
+        config.add_whitelist_path("/health")
+        config.add_whitelist_path("/stats")
+        config.add_whitelist_path("/security")
+        config.add_whitelist_path("/rate-limit")
+        config.add_whitelist_path("/api/mcp")
+        config.add_whitelist_path("/threat")  # 威胁防护管理接口
+        
+        threat_engine = ThreatProtectionEngine(config)
+        logger.info("=" * 60)
+        logger.info("Three-Level Threat Protection System ENABLED")
+        logger.info("  Level 1: Watch List (1st violation)")
+        logger.info("  Level 2: Warning List (3+ violations) -> Email alert")
+        logger.info("  Level 3: Blacklist (5+ violations) -> Block requests")
+        logger.info("=" * 60)
+    except Exception as e:
+        logger.error(f"Failed to initialize ThreatProtection: {e}")
+        threat_engine = None
+
+# 延迟初始化（在 PROXY_CONFIG 定义后）
 
 # CORS 配置
 app.add_middleware(
@@ -79,6 +136,9 @@ PROXY_CONFIG = {
     '/api/Qwen3VL32B': {'target': 'https://api.suanli.cn', 'rewrite': '/v1'},
     '/api/Qwen330BA3B': {'target': 'https://api.suanli.cn', 'rewrite': '/v1'}
 }
+
+# 初始化三级威胁防护系统（在 PROXY_CONFIG 定义后）
+init_threat_protection()
 
 EXCLUDED_HEADERS = {
     'host', 'content-length', 'transfer-encoding',
@@ -1297,28 +1357,60 @@ def determine_security_event_type(error_message: str) -> str:
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_handler(request: Request, path: str):
     """
-    代理处理器 - 带增强路径安全防护和速率限制
+    代理处理器 - 带增强路径安全防护、速率限制和三级威胁防护
 
     安全措施：
-    1. 速率限制 - 防止 DDoS 和暴力攻击
-    2. 路径验证 - 检查危险模式和敏感路径
-    3. URL 验证 - 防止 SSRF 和 URL 注入
-    4. 白名单匹配 - 只允许配置的代理路径
-    5. 请求日志 - 记录所有安全相关事件
-    6. 安全事件统计 - 记录和追踪安全事件
-    7. 自动封禁 - 对恶意 IP 自动封禁
+    1. 三级威胁防护 - 观察名单 -> 预警名单 -> 黑名单
+    2. 速率限制 - 防止 DDoS 和暴力攻击
+    3. 路径验证 - 检查危险模式和敏感路径
+    4. URL 验证 - 防止 SSRF 和 URL 注入
+    5. 白名单匹配 - 只允许配置的代理路径
+    6. 请求日志 - 记录所有安全相关事件
+    7. 安全事件统计 - 记录和追踪安全事件
+    8. 自动封禁 - 对恶意 IP 自动封禁
     """
     request_id = get_request_id()
     client_ip = get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "")
 
     # 排除已定义的特定路由（这些路由不受速率限制）
     # 注意：这些路由通常由 FastAPI 优先匹配到特定的 handler，
     # 但如果请求方法不匹配（例如对 /health 发送 POST 请求），则会回退到此通配符路由。
-    excluded_paths = ["api/mcp/exa", "health", "stats", "security/stats", "rate-limit/stats", "rate-limit/banned", ""]
+    excluded_paths = ["api/mcp/exa", "health", "stats", "security/stats", "rate-limit/stats", "rate-limit/banned", "threat/stats", "threat/ip", ""]
     if path in excluded_paths:
         return JSONResponse(status_code=404, content={"error": "Not Found", "request_id": request_id})
 
     full_path = "/" + path
+    
+    # === 安全检查 -1: 三级威胁防护检查（最高优先级） ===
+    if threat_engine is not None:
+        threat_allowed, threat_reason, threat_level = threat_engine.check_request(
+            ip=client_ip,
+            path=full_path,
+            method=request.method,
+            user_agent=user_agent,
+            request_id=request_id
+        )
+        
+        if not threat_allowed:
+            # IP 在黑名单中，直接拒绝
+            logger.warning(f"[{request_id}] THREAT BLOCKED: {threat_reason} | IP: {client_ip} | Path: {full_path[:100]}")
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "Access denied",
+                    "detail": threat_reason,
+                    "threat_level": threat_level.name if threat_level else "UNKNOWN",
+                    "request_id": request_id
+                },
+                headers={
+                    "X-Threat-Level": threat_level.name if threat_level else "UNKNOWN"
+                }
+            )
+        
+        # 如果检测到威胁但未达到黑名单级别，记录但允许继续
+        if threat_level and threat_level != ThreatLevel.NONE:
+            logger.info(f"[{request_id}] THREAT DETECTED (allowed): level={threat_level.name} | IP: {client_ip}")
     
     # 校验必需的 headers
     headers_dict = {k.lower(): v for k, v in request.headers.items()}
@@ -1617,21 +1709,164 @@ async def unban_ip(ip: str):
         )
 
 
+# ============================================================
+# 三级威胁防护管理接口
+# ============================================================
+
+@app.get("/threat/stats")
+async def threat_stats():
+    """获取三级威胁防护统计信息"""
+    if threat_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Threat protection system not available"}
+        )
+    
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "enabled": True,
+        "statistics": threat_engine.get_stats(),
+        "config": {
+            "watch_threshold": threat_engine.config.WATCH_THRESHOLD,
+            "warning_threshold": threat_engine.config.WARNING_THRESHOLD,
+            "blacklist_threshold": threat_engine.config.BLACKLIST_THRESHOLD,
+            "blacklist_duration_days": threat_engine.config.BLACKLIST_DURATION // 86400,
+            "email_enabled": threat_engine.config.EMAIL_ENABLED
+        }
+    }
+
+
+@app.get("/threat/ip/{ip}")
+async def threat_ip_status(ip: str):
+    """查询 IP 的威胁状态"""
+    if threat_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Threat protection system not available"}
+        )
+    
+    status = threat_engine.get_ip_status(ip)
+    if status is None:
+        return {"ip": ip, "status": "not_tracked", "threat_level": "NONE"}
+    return status
+
+
+@app.get("/threat/list/{level}")
+async def threat_list_by_level(level: str):
+    """获取指定威胁级别的 IP 列表"""
+    if threat_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Threat protection system not available"}
+        )
+    
+    try:
+        threat_level = ThreatLevel[level.upper()]
+    except (KeyError, AttributeError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Invalid level: {level}. Valid levels: WATCH, WARNING, BLACKLIST"}
+        )
+    
+    return {
+        "level": level.upper(),
+        "ips": threat_engine.get_all_ips_by_level(threat_level)
+    }
+
+
+@app.post("/threat/blacklist/{ip}")
+async def threat_blacklist_ip(ip: str, reason: str = "Manual blacklist", permanent: bool = False):
+    """手动将 IP 加入黑名单"""
+    if threat_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Threat protection system not available"}
+        )
+    
+    success = threat_engine.manual_blacklist(ip, reason, permanent)
+    return {
+        "success": success,
+        "ip": ip,
+        "action": "blacklisted",
+        "permanent": permanent,
+        "reason": reason
+    }
+
+
+@app.post("/threat/unblock/{ip}")
+async def threat_unblock_ip(ip: str, reason: str = "Manual unblock"):
+    """手动解除 IP 封禁"""
+    if threat_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Threat protection system not available"}
+        )
+    
+    success = threat_engine.manual_unblock(ip, reason)
+    if not success:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"IP {ip} not found in threat list"}
+        )
+    return {
+        "success": success,
+        "ip": ip,
+        "action": "unblocked",
+        "reason": reason
+    }
+
+
+@app.get("/threat/logs")
+async def threat_logs(limit: int = 50, ip: str = None):
+    """获取威胁防护操作日志"""
+    if threat_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Threat protection system not available"}
+        )
+    
+    return {
+        "logs": threat_engine.get_recent_operations(limit=limit, ip_filter=ip)
+    }
+
+
+@app.post("/threat/cleanup")
+async def threat_cleanup():
+    """清理过期的威胁记录"""
+    if threat_engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Threat protection system not available"}
+        )
+    
+    cleaned = threat_engine.cleanup_expired_records()
+    return {
+        "cleaned": cleaned,
+        "message": f"Cleaned {cleaned} expired records"
+    }
+
+
 @app.get("/")
 async def root():
     return {
-        "service": "OpenAI API Proxy Gateway with MCP",
+        "service": "OpenAI API Proxy Gateway with MCP + Threat Protection",
         "status": "running",
         "security": "enhanced",
         "features": [
+            "Three-level threat protection (Watch -> Warning -> Blacklist)",
             "Path traversal protection",
             "SSRF prevention",
             "URL injection protection",
             "Sensitive path blocking",
             "Request validation",
             "Rate limiting with auto-ban",
-            "DDoS protection"
+            "DDoS protection",
+            "Email alerts for warnings"
         ],
+        "threat_protection": {
+            "enabled": threat_engine is not None,
+            "levels": ["WATCH (1st violation)", "WARNING (3+ violations)", "BLACKLIST (5+ violations)"]
+        },
         "rate_limit": {
             "max_requests_per_minute": RateLimiterConfig.MAX_REQUESTS_PER_WINDOW,
             "ban_threshold_rps": RateLimiterConfig.BAN_THRESHOLD_RPS
