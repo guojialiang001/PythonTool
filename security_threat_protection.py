@@ -80,6 +80,7 @@ class ViolationType(Enum):
     HIGH_FREQUENCY = "high_frequency"         # 高频请求
     SCANNER_DETECTED = "scanner_detected"     # 扫描器检测
     MALFORMED_REQUEST = "malformed_request"   # 畸形请求
+    WEBDAV_PROPFIND = "webdav_propfind"       # WebDAV PROPFIND 探测
     UNKNOWN = "unknown"                       # 未知类型
 
 
@@ -661,7 +662,16 @@ class ThreatDetector:
                     return True, ViolationType.PATH_TRAVERSAL, f"Path traversal detected: {pattern.pattern}"
                 return True, ViolationType.INJECTION_ATTEMPT, f"Dangerous pattern detected: {pattern.pattern}"
         
-        # 3. 检查异常路径
+        # 3. 检查 WebDAV PROPFIND 请求（常用于服务器探测）
+        if method.upper() == "PROPFIND":
+            return True, ViolationType.WEBDAV_PROPFIND, f"WebDAV PROPFIND request detected"
+
+        # 4. 检查其他危险 HTTP 方法
+        dangerous_methods = ["PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK"]
+        if method.upper() in dangerous_methods:
+            return True, ViolationType.WEBDAV_PROPFIND, f"Dangerous HTTP method detected: {method}"
+
+        # 5. 检查异常路径
         for pattern in self.config._abnormal_patterns:
             if pattern.search(path):
                 return True, ViolationType.ABNORMAL_PATH, f"Abnormal path detected: {path[:100]}"
