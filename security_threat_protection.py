@@ -146,8 +146,8 @@ class ThreatProtectionConfig:
         
         # === 级别升级阈值 ===
         self.WATCH_THRESHOLD: int = int(os.getenv("THREAT_WATCH_THRESHOLD", "1"))
-        self.WARNING_THRESHOLD: int = int(os.getenv("THREAT_WARNING_THRESHOLD", "3"))
-        self.BLACKLIST_THRESHOLD: int = int(os.getenv("THREAT_BLACKLIST_THRESHOLD", "5"))
+        self.WARNING_THRESHOLD: int = int(os.getenv("THREAT_WARNING_THRESHOLD", "1"))
+        self.BLACKLIST_THRESHOLD: int = int(os.getenv("THREAT_BLACKLIST_THRESHOLD", "1"))
         
         # === 时间窗口配置（秒） ===
         self.VIOLATION_WINDOW: int = int(os.getenv("THREAT_VIOLATION_WINDOW", "86400"))  # 24小时
