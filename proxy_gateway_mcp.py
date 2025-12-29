@@ -136,7 +136,11 @@ PROXY_CONFIG = {
     '/api/qwen': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'},
     '/api/deepseekv32': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'},
     '/api/Qwen3VL32B': {'target': 'https://api.suanli.cn', 'rewrite': '/v1'},
-    '/api/Qwen330BA3B': {'target': 'https://api.suanli.cn', 'rewrite': '/v1'}
+    '/api/Qwen330BA3B': {'target': 'https://api.suanli.cn', 'rewrite': '/v1'},
+    '/api/qwenCoderPlus': {'target': 'https://apis.iflow.cn', 'rewrite': '/v1'},
+    '/api/qwenVLPlus': {'target': 'https://apis.iflow.cn', 'rewrite': '/v1'},
+    '/api/qwenMax': {'target': 'https://apis.iflow.cn', 'rewrite': '/v1'},
+    '/api/kimiK2': {'target': 'https://apis.iflow.cn', 'rewrite': '/v1'}
 }
 
 # 初始化三级威胁防护系统（在 PROXY_CONFIG 定义后）
@@ -811,10 +815,15 @@ REQUIRED_HEADERS = {
     'referer': 'https://www.toproject.cloud/'
 }
 
-HTTP_CLIENT_LIMITS = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0)
+HTTP_CLIENT_LIMITS = httpx.Limits(max_keepalive_connections=60, max_connections=120, keepalive_expiry=30.0)
 http_client: Optional[httpx.AsyncClient] = None
 thread_pool: Optional[ThreadPoolExecutor] = None
-THREAD_POOL_SIZE = min(20, (os.cpu_count() or 1) * 4)
+# 对于2G2核服务器处理18并发的优化配置：
+# - 使用20个线程（略大于并发数，留有余量）
+# - 这是异步I/O密集型任务，线程主要等待网络响应
+# - 2核CPU可以支持20个I/O等待线程而不会过度负载
+# - 内存占用约：20线程 * 10MB = 200MB，仍在安全范围内
+THREAD_POOL_SIZE = 20
 request_counter = 0
 request_counter_lock = threading.Lock()
 
