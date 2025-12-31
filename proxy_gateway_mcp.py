@@ -141,7 +141,8 @@ PROXY_CONFIG = {
     '/api/qwenVLPlus': {'target': 'https://apis.iflow.cn', 'rewrite': '/v1'},
     '/api/qwenMax': {'target': 'https://apis.iflow.cn', 'rewrite': '/v1'},
     '/api/kimiK2': {'target': 'https://apis.iflow.cn', 'rewrite': '/v1'},
-    '/api/doubaoSeed': {'target': 'https://api.routin.ai', 'rewrite': '/v1'}
+    '/api/doubaoSeed': {'target': 'https://api.routin.ai', 'rewrite': '/v1'},
+    '/api/mistral': {'target': 'https://api.mistral.ai', 'rewrite': '/v1'}
 }
 
 # 初始化三级威胁防护系统（在 PROXY_CONFIG 定义后）
