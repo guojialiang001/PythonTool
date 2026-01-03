@@ -1,10 +1,16 @@
 #!/bin/bash
 
 # ============================================================================
-# Orchestrator Service 启动脚本 (Linux)
-# 
-# 这是一个代理服务，将请求转发到后端 8.136.32.51
-# 
+# Orchestrator Proxy Service 启动脚本 (Linux)
+#
+# 代理转发服务，只中转以下两个请求到后端 8.136.32.5:8000
+#
+# 转发规则:
+#   #1 HTTP:  POST /endpoint/chat/conversations/start
+#             -> http://8.136.32.5:8000/api/v1/chat/conversations/start
+#   #2 WS:    /endpoint/ws/chat?token=xxx
+#             -> ws://8.136.32.5:8000/ws/chat?token=xxx
+#
 # 使用方法:
 #   ./start_orchestrator.sh              # 前台启动
 #   ./start_orchestrator.sh --daemon     # 后台启动 (PM2)
@@ -25,20 +31,22 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # 服务配置
-SERVICE_NAME="orchestrator-service"
+SERVICE_NAME="orchestrator-proxy"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_SCRIPT="orchestrator_service.py"
 LOG_DIR="${SCRIPT_DIR}/logs"
 PID_FILE="${LOG_DIR}/${SERVICE_NAME}.pid"
 
 # 环境变量配置
-export ORCHESTRATOR_HOST="${ORCHESTRATOR_HOST:-0.0.0.0}"
-export ORCHESTRATOR_PORT="${ORCHESTRATOR_PORT:-8001}"
-export SERVER_DOMAIN="${SERVER_DOMAIN:-sandbox.toproject.cloud}"
-export SERVER_IP="${SERVER_IP:-8.136.32.51}"
-export API_PREFIX="${API_PREFIX:-/orchestrator}"
+export PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
+export PROXY_PORT="${PROXY_PORT:-8001}"
+export BACKEND_HOST="${BACKEND_HOST:-8.136.32.5}"
+export BACKEND_PORT="${BACKEND_PORT:-8000}"
+export ENDPOINT_PREFIX="${ENDPOINT_PREFIX:-/endpoint}"
+export BACKEND_API_PREFIX="${BACKEND_API_PREFIX:-/api/v1}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
-export SESSION_TIMEOUT="${SESSION_TIMEOUT:-3600}"
+export HTTP_TIMEOUT="${HTTP_TIMEOUT:-30}"
+export WS_TIMEOUT="${WS_TIMEOUT:-60}"
 
 # 打印带颜色的消息
 print_info() {
@@ -61,12 +69,23 @@ print_error() {
 print_banner() {
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════════════════╗"
-    echo "║        Orchestrator Service - 代理服务启动脚本                             ║"
+    echo "║        Orchestrator Proxy Service - 代理转发服务                           ║"
     echo "╠════════════════════════════════════════════════════════════════════════════╣"
-    echo "║  服务说明:                                                                  ║"
-    echo "║    - 这是一个代理服务，转发请求到后端 ${SERVER_IP}                    ║"
-    echo "║    - 对外域名: ${SERVER_DOMAIN}                                ║"
-    echo "║    - 监听端口: ${ORCHESTRATOR_PORT}                                                    ║"
+    echo "║  说明: 只中转以下两个指定请求                                               ║"
+    echo "╠════════════════════════════════════════════════════════════════════════════╣"
+    echo "║  配置:                                                                      ║"
+    echo "║    - 监听地址: ${PROXY_HOST}:${PROXY_PORT}                                             ║"
+    echo "║    - 后端地址: ${BACKEND_HOST}:${BACKEND_PORT}                                       ║"
+    echo "║    - 本地前缀: ${ENDPOINT_PREFIX}                                                ║"
+    echo "║    - 后端前缀: ${BACKEND_API_PREFIX}                                               ║"
+    echo "╠════════════════════════════════════════════════════════════════════════════╣"
+    echo "║  转发规则:                                                                  ║"
+    echo "║  #1 HTTP POST (开始新对话，获取 Token):                                     ║"
+    echo "║      本地: POST ${ENDPOINT_PREFIX}/chat/conversations/start                      ║"
+    echo "║      后端: POST http://${BACKEND_HOST}:${BACKEND_PORT}${BACKEND_API_PREFIX}/chat/conversations/start ║"
+    echo "║  #2 WebSocket (对话):                                                       ║"
+    echo "║      本地: WS ${ENDPOINT_PREFIX}/ws/chat?token=xxx                               ║"
+    echo "║      后端: WS ws://${BACKEND_HOST}:${BACKEND_PORT}/ws/chat?token=xxx             ║"
     echo "╚════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -102,9 +121,14 @@ check_dependencies() {
         pip install uvicorn
     }
     
-    $PYTHON_CMD -c "import pydantic" 2>/dev/null || {
-        print_warning "缺少 pydantic，正在安装..."
-        pip install pydantic
+    $PYTHON_CMD -c "import httpx" 2>/dev/null || {
+        print_warning "缺少 httpx，正在安装..."
+        pip install httpx
+    }
+    
+    $PYTHON_CMD -c "import websockets" 2>/dev/null || {
+        print_warning "缺少 websockets，正在安装..."
+        pip install websockets
     }
     
     print_success "依赖检查完成"
@@ -150,10 +174,9 @@ start_foreground() {
         exit 1
     fi
     
-    print_info "启动服务 (前台模式)..."
-    print_info "监听地址: ${ORCHESTRATOR_HOST}:${ORCHESTRATOR_PORT}"
-    print_info "API 前缀: ${API_PREFIX}"
-    print_info "后端地址: ${SERVER_IP}"
+    print_info "启动代理服务 (前台模式)..."
+    print_info "监听地址: ${PROXY_HOST}:${PROXY_PORT}"
+    print_info "后端地址: ${BACKEND_HOST}:${BACKEND_PORT}"
     echo ""
     
     cd "$SCRIPT_DIR"
@@ -194,13 +217,15 @@ module.exports = {
     cwd: '${SCRIPT_DIR}',
     interpreter: 'none',
     env: {
-      ORCHESTRATOR_HOST: '${ORCHESTRATOR_HOST}',
-      ORCHESTRATOR_PORT: '${ORCHESTRATOR_PORT}',
-      SERVER_DOMAIN: '${SERVER_DOMAIN}',
-      SERVER_IP: '${SERVER_IP}',
-      API_PREFIX: '${API_PREFIX}',
+      PROXY_HOST: '${PROXY_HOST}',
+      PROXY_PORT: '${PROXY_PORT}',
+      BACKEND_HOST: '${BACKEND_HOST}',
+      BACKEND_PORT: '${BACKEND_PORT}',
+      ENDPOINT_PREFIX: '${ENDPOINT_PREFIX}',
+      BACKEND_API_PREFIX: '${BACKEND_API_PREFIX}',
       LOG_LEVEL: '${LOG_LEVEL}',
-      SESSION_TIMEOUT: '${SESSION_TIMEOUT}'
+      HTTP_TIMEOUT: '${HTTP_TIMEOUT}',
+      WS_TIMEOUT: '${WS_TIMEOUT}'
     },
     log_file: '${LOG_DIR}/${SERVICE_NAME}.log',
     error_file: '${LOG_DIR}/${SERVICE_NAME}-error.log',
@@ -226,11 +251,10 @@ EOF
     pm2 show "$SERVICE_NAME"
     
     echo ""
-    print_info "访问地址:"
-    echo "  - 健康检查: http://localhost:${ORCHESTRATOR_PORT}${API_PREFIX}/health"
-    echo "  - 服务信息: http://localhost:${ORCHESTRATOR_PORT}${API_PREFIX}/info"
-    echo "  - API 文档: http://localhost:${ORCHESTRATOR_PORT}${API_PREFIX}/docs"
-    echo "  - WebSocket: ws://localhost:${ORCHESTRATOR_PORT}${API_PREFIX}/ws?user_id=test&session_id=test"
+    print_info "测试地址:"
+    echo "  - 健康检查: curl http://localhost:${PROXY_PORT}/health"
+    echo "  - 服务信息: curl http://localhost:${PROXY_PORT}/"
+    echo "  - API 文档: http://localhost:${PROXY_PORT}/docs"
 }
 
 # 使用 nohup 启动
@@ -251,10 +275,10 @@ start_with_nohup() {
     if is_running; then
         print_success "服务已启动 (PID: $(cat $PID_FILE))"
         echo ""
-        print_info "访问地址:"
-        echo "  - 健康检查: http://localhost:${ORCHESTRATOR_PORT}${API_PREFIX}/health"
-        echo "  - 服务信息: http://localhost:${ORCHESTRATOR_PORT}${API_PREFIX}/info"
-        echo "  - API 文档: http://localhost:${ORCHESTRATOR_PORT}${API_PREFIX}/docs"
+        print_info "测试地址:"
+        echo "  - 健康检查: curl http://localhost:${PROXY_PORT}/health"
+        echo "  - 服务信息: curl http://localhost:${PROXY_PORT}/"
+        echo "  - API 文档: http://localhost:${PROXY_PORT}/docs"
         echo ""
         print_info "日志文件: ${LOG_DIR}/${SERVICE_NAME}.log"
     else
@@ -302,14 +326,14 @@ show_status() {
         PID=$(cat "$PID_FILE")
         echo "  状态: 运行中"
         echo "  PID: $PID"
-        echo "  监听: ${ORCHESTRATOR_HOST}:${ORCHESTRATOR_PORT}"
-        echo "  后端: ${SERVER_IP}"
+        echo "  监听: ${PROXY_HOST}:${PROXY_PORT}"
+        echo "  后端: ${BACKEND_HOST}:${BACKEND_PORT}"
         echo ""
         
         # 尝试获取健康状态
         if command -v curl &> /dev/null; then
             print_info "健康检查:"
-            curl -s "http://localhost:${ORCHESTRATOR_PORT}${API_PREFIX}/health" | python3 -m json.tool 2>/dev/null || echo "  无法获取健康状态"
+            curl -s "http://localhost:${PROXY_PORT}/health" | python3 -m json.tool 2>/dev/null || echo "  无法获取健康状态"
         fi
     else
         echo "  状态: 未运行"
@@ -321,7 +345,7 @@ show_logs() {
     if check_pm2 && pm2 list | grep -q "$SERVICE_NAME"; then
         pm2 logs "$SERVICE_NAME" --lines 100
     elif [ -f "${LOG_DIR}/${SERVICE_NAME}.log" ]; then
-        tail -f "${LOG_DIR}/${SERVICE_NAME}.log"
+        tail -100 "${LOG_DIR}/${SERVICE_NAME}.log"
     else
         print_warning "未找到日志文件"
     fi
@@ -348,9 +372,31 @@ show_monit() {
     fi
 }
 
+# 测试代理
+test_proxy() {
+    print_info "测试代理服务..."
+    echo ""
+    
+    # 测试健康检查
+    print_info "1. 健康检查:"
+    curl -s "http://localhost:${PROXY_PORT}/health" | python3 -m json.tool 2>/dev/null || echo "  请求失败"
+    echo ""
+    
+    # 测试服务信息
+    print_info "2. 服务信息:"
+    curl -s "http://localhost:${PROXY_PORT}/" | python3 -m json.tool 2>/dev/null || echo "  请求失败"
+    echo ""
+    
+    # 测试后端连接
+    print_info "3. 后端连接测试:"
+    curl -s "http://${BACKEND_HOST}:${BACKEND_PORT}/health" | python3 -m json.tool 2>/dev/null || echo "  后端不可达"
+}
+
 # 显示帮助
 show_help() {
-    echo "Orchestrator Service 启动脚本"
+    echo "Orchestrator Proxy Service 启动脚本"
+    echo ""
+    echo "说明: 只中转以下两个指定请求"
     echo ""
     echo "用法: $0 [选项]"
     echo ""
@@ -364,21 +410,34 @@ show_help() {
     echo "  --logs        查看最近日志"
     echo "  --follow      实时查看日志"
     echo "  --monit       PM2 监控面板"
+    echo "  --test        测试代理服务"
     echo "  --help        显示此帮助信息"
     echo ""
     echo "环境变量:"
-    echo "  ORCHESTRATOR_HOST   监听地址 (默认: 0.0.0.0)"
-    echo "  ORCHESTRATOR_PORT   监听端口 (默认: 8001)"
-    echo "  SERVER_DOMAIN       对外域名 (默认: sandbox.toproject.cloud)"
-    echo "  SERVER_IP           后端 IP (默认: 8.136.32.51)"
-    echo "  API_PREFIX          API 前缀 (默认: /orchestrator)"
-    echo "  LOG_LEVEL           日志级别 (默认: INFO)"
-    echo "  SESSION_TIMEOUT     会话超时秒数 (默认: 3600)"
+    echo "  PROXY_HOST         代理监听地址 (默认: 0.0.0.0)"
+    echo "  PROXY_PORT         代理监听端口 (默认: 8001)"
+    echo "  BACKEND_HOST       后端服务器地址 (默认: 8.136.32.5)"
+    echo "  BACKEND_PORT       后端服务器端口 (默认: 8000)"
+    echo "  ENDPOINT_PREFIX    本地端点前缀 (默认: /endpoint)"
+    echo "  BACKEND_API_PREFIX 后端 API 前缀 (默认: /api/v1)"
+    echo "  LOG_LEVEL          日志级别 (默认: INFO)"
+    echo "  HTTP_TIMEOUT       HTTP 超时秒数 (默认: 30)"
+    echo "  WS_TIMEOUT         WebSocket 超时秒数 (默认: 60)"
+    echo ""
+    echo "转发规则:"
+    echo "  #1 HTTP POST (开始新对话，获取 Token):"
+    echo "     本地: POST \${ENDPOINT_PREFIX}/chat/conversations/start"
+    echo "     后端: POST http://\${BACKEND_HOST}:\${BACKEND_PORT}\${BACKEND_API_PREFIX}/chat/conversations/start"
+    echo ""
+    echo "  #2 WebSocket (对话):"
+    echo "     本地: WS \${ENDPOINT_PREFIX}/ws/chat?token=<jwt_token>"
+    echo "     后端: WS ws://\${BACKEND_HOST}:\${BACKEND_PORT}/ws/chat?token=<jwt_token>"
     echo ""
     echo "示例:"
-    echo "  $0                           # 前台启动"
-    echo "  $0 --daemon                  # 后台启动"
-    echo "  ORCHESTRATOR_PORT=9000 $0    # 使用自定义端口启动"
+    echo "  $0                              # 前台启动"
+    echo "  $0 --daemon                     # 后台启动"
+    echo "  PROXY_PORT=9000 $0              # 使用自定义端口启动"
+    echo "  ENDPOINT_PREFIX=/api/proxy $0   # 使用自定义前缀"
 }
 
 # 主入口
@@ -411,6 +470,9 @@ case "${1:-}" in
         ;;
     --monit|-m)
         show_monit
+        ;;
+    --test|-t)
+        test_proxy
         ;;
     --help|-h)
         show_help
