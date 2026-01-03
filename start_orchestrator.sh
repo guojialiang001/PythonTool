@@ -1,14 +1,15 @@
 #!/bin/bash
 #
-# Orchestrator Service 启动脚本
+# Orchestrator Service 启动脚本 (PM2 版本)
 # 远程后台代理服务 - WebSocket 优先的 AI Agent 调度服务
 #
 # 使用方法:
-#   ./start_orchestrator.sh              # 前台运行
-#   ./start_orchestrator.sh --daemon     # 后台运行
+#   ./start_orchestrator.sh              # 使用 PM2 启动服务
 #   ./start_orchestrator.sh --stop       # 停止服务
+#   ./start_orchestrator.sh --restart    # 重启服务
 #   ./start_orchestrator.sh --status     # 查看状态
 #   ./start_orchestrator.sh --logs       # 查看日志
+#   ./start_orchestrator.sh --monit      # 打开 PM2 监控面板
 #
 
 # 脚本所在目录
@@ -16,10 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # 服务配置
-SERVICE_NAME="orchestrator_service"
+SERVICE_NAME="orchestrator-service"
 PYTHON_SCRIPT="orchestrator_service.py"
-PID_FILE="/tmp/${SERVICE_NAME}.pid"
-LOG_FILE="/tmp/${SERVICE_NAME}.log"
 
 # 环境变量配置（可根据需要修改）
 export ORCHESTRATOR_HOST="${ORCHESTRATOR_HOST:-0.0.0.0}"
@@ -58,6 +57,17 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# 检查 PM2 是否安装
+check_pm2() {
+    if ! command -v pm2 &> /dev/null; then
+        print_error "PM2 未安装"
+        print_info "请先安装 PM2: npm install -g pm2"
+        print_info "或者: yarn global add pm2"
+        exit 1
+    fi
+    print_info "PM2 版本: $(pm2 -v)"
+}
+
 # 检查 Python 环境
 check_python() {
     if command -v python3 &> /dev/null; then
@@ -69,14 +79,17 @@ check_python() {
         exit 1
     fi
     
+    # 获取 Python 完整路径
+    PYTHON_PATH=$(which $PYTHON_CMD)
+    
     # 检查 Python 版本
     PYTHON_VERSION=$($PYTHON_CMD -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    print_info "Python 版本: $PYTHON_VERSION"
+    print_info "Python 版本: $PYTHON_VERSION ($PYTHON_PATH)"
 }
 
 # 检查依赖
 check_dependencies() {
-    print_info "检查依赖..."
+    print_info "检查 Python 依赖..."
     
     # 检查必需的包
     REQUIRED_PACKAGES=("fastapi" "uvicorn" "pydantic")
@@ -97,140 +110,189 @@ check_dependencies() {
     print_success "依赖检查完成"
 }
 
-# 获取服务 PID
-get_pid() {
-    if [ -f "$PID_FILE" ]; then
-        cat "$PID_FILE"
-    else
-        # 尝试通过进程名查找
-        pgrep -f "$PYTHON_SCRIPT" 2>/dev/null | head -1
+# 生成 PM2 ecosystem 配置文件
+generate_ecosystem_config() {
+    cat > ecosystem.config.js << EOF
+module.exports = {
+  apps: [{
+    name: '${SERVICE_NAME}',
+    script: '${PYTHON_PATH}',
+    args: '${PYTHON_SCRIPT}',
+    cwd: '${SCRIPT_DIR}',
+    interpreter: 'none',
+    
+    // 环境变量
+    env: {
+      ORCHESTRATOR_HOST: '${ORCHESTRATOR_HOST}',
+      ORCHESTRATOR_PORT: '${ORCHESTRATOR_PORT}',
+      REDIS_URL: '${REDIS_URL}',
+      LOG_LEVEL: '${LOG_LEVEL}',
+      LLM_API_KEY: process.env.LLM_API_KEY || '',
+      LLM_API_BASE_URL: process.env.LLM_API_BASE_URL || '',
+      LLM_MODEL: process.env.LLM_MODEL || '',
+      LLM_MAX_TOKENS: process.env.LLM_MAX_TOKENS || '4096',
+      LLM_TEMPERATURE: process.env.LLM_TEMPERATURE || '0.7'
+    },
+    
+    // 实例配置
+    instances: 1,
+    exec_mode: 'fork',
+    
+    // 自动重启配置
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '1G',
+    
+    // 重启策略
+    exp_backoff_restart_delay: 100,
+    max_restarts: 10,
+    min_uptime: '10s',
+    
+    // 日志配置
+    log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+    error_file: '${SCRIPT_DIR}/logs/orchestrator-error.log',
+    out_file: '${SCRIPT_DIR}/logs/orchestrator-out.log',
+    merge_logs: true,
+    
+    // 优雅关闭
+    kill_timeout: 5000,
+    listen_timeout: 3000,
+    
+    // 健康检查 (可选)
+    // health_check: {
+    //   url: 'http://localhost:${ORCHESTRATOR_PORT}/health',
+    //   interval: 30000
+    // }
+  }]
+};
+EOF
+    print_info "已生成 PM2 配置文件: ecosystem.config.js"
+}
+
+# 创建日志目录
+create_log_dir() {
+    if [ ! -d "${SCRIPT_DIR}/logs" ]; then
+        mkdir -p "${SCRIPT_DIR}/logs"
+        print_info "已创建日志目录: ${SCRIPT_DIR}/logs"
     fi
 }
 
 # 检查服务是否运行
 is_running() {
-    local pid=$(get_pid)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        return 0
-    fi
-    return 1
+    pm2 describe "$SERVICE_NAME" &> /dev/null
+    return $?
 }
 
-# 启动服务（前台）
-start_foreground() {
-    if is_running; then
-        print_warning "服务已在运行中 (PID: $(get_pid))"
-        exit 1
-    fi
-    
+# 启动服务
+start_service() {
+    check_pm2
     check_python
     check_dependencies
+    create_log_dir
+    generate_ecosystem_config
     
-    print_info "启动 Orchestrator Service (前台模式)..."
-    print_info "监听地址: ${ORCHESTRATOR_HOST}:${ORCHESTRATOR_PORT}"
-    print_info "按 Ctrl+C 停止服务"
-    echo ""
-    
-    $PYTHON_CMD "$PYTHON_SCRIPT"
-}
-
-# 启动服务（后台）
-start_daemon() {
     if is_running; then
-        print_warning "服务已在运行中 (PID: $(get_pid))"
-        exit 1
+        print_warning "服务已在运行中"
+        pm2 describe "$SERVICE_NAME"
+        exit 0
     fi
     
-    check_python
-    check_dependencies
+    print_info "使用 PM2 启动 Orchestrator Service..."
     
-    print_info "启动 Orchestrator Service (后台模式)..."
-    
-    # 后台启动
-    nohup $PYTHON_CMD "$PYTHON_SCRIPT" > "$LOG_FILE" 2>&1 &
-    local pid=$!
-    echo $pid > "$PID_FILE"
+    pm2 start ecosystem.config.js
     
     # 等待启动
     sleep 2
     
     if is_running; then
         print_success "服务启动成功"
-        print_info "PID: $pid"
-        print_info "日志文件: $LOG_FILE"
+        echo ""
+        pm2 describe "$SERVICE_NAME"
+        echo ""
         print_info "监听地址: ${ORCHESTRATOR_HOST}:${ORCHESTRATOR_PORT}"
         print_info "WebSocket 端点: ws://${ORCHESTRATOR_HOST}:${ORCHESTRATOR_PORT}/ws?user_id=xxx"
+        print_info "健康检查: http://${ORCHESTRATOR_HOST}:${ORCHESTRATOR_PORT}/health"
+        echo ""
+        print_info "常用命令:"
+        echo "  查看日志:   pm2 logs ${SERVICE_NAME}"
+        echo "  查看状态:   pm2 status"
+        echo "  监控面板:   pm2 monit"
+        echo "  重启服务:   pm2 restart ${SERVICE_NAME}"
+        echo "  停止服务:   pm2 stop ${SERVICE_NAME}"
+        
+        # 保存 PM2 进程列表（开机自启）
+        print_info ""
+        print_info "如需开机自启，请执行:"
+        echo "  pm2 save"
+        echo "  pm2 startup"
     else
-        print_error "服务启动失败，请查看日志: $LOG_FILE"
-        rm -f "$PID_FILE"
+        print_error "服务启动失败"
+        pm2 logs "$SERVICE_NAME" --lines 20
         exit 1
     fi
 }
 
 # 停止服务
 stop_service() {
-    local pid=$(get_pid)
+    check_pm2
     
-    if [ -z "$pid" ]; then
+    if ! is_running; then
         print_warning "服务未运行"
-        rm -f "$PID_FILE"
         return 0
     fi
     
-    print_info "正在停止服务 (PID: $pid)..."
-    
-    # 发送 SIGTERM
-    kill -15 "$pid" 2>/dev/null
-    
-    # 等待进程结束
-    local count=0
-    while kill -0 "$pid" 2>/dev/null && [ $count -lt 10 ]; do
-        sleep 1
-        count=$((count + 1))
-    done
-    
-    # 如果还在运行，强制终止
-    if kill -0 "$pid" 2>/dev/null; then
-        print_warning "服务未响应，强制终止..."
-        kill -9 "$pid" 2>/dev/null
-    fi
-    
-    rm -f "$PID_FILE"
+    print_info "正在停止服务..."
+    pm2 stop "$SERVICE_NAME"
+    pm2 delete "$SERVICE_NAME"
     print_success "服务已停止"
 }
 
 # 重启服务
 restart_service() {
-    print_info "重启服务..."
-    stop_service
-    sleep 2
-    start_daemon
+    check_pm2
+    
+    if ! is_running; then
+        print_warning "服务未运行，正在启动..."
+        start_service
+        return
+    fi
+    
+    print_info "正在重启服务..."
+    pm2 restart "$SERVICE_NAME"
+    print_success "服务已重启"
+    pm2 describe "$SERVICE_NAME"
+}
+
+# 重载服务（零停机）
+reload_service() {
+    check_pm2
+    
+    if ! is_running; then
+        print_warning "服务未运行，正在启动..."
+        start_service
+        return
+    fi
+    
+    print_info "正在重载服务 (零停机)..."
+    pm2 reload "$SERVICE_NAME"
+    print_success "服务已重载"
 }
 
 # 查看状态
 show_status() {
+    check_pm2
+    
     if is_running; then
-        local pid=$(get_pid)
         print_success "服务运行中"
         echo ""
-        echo "  PID:          $pid"
-        echo "  监听地址:     ${ORCHESTRATOR_HOST}:${ORCHESTRATOR_PORT}"
-        echo "  日志文件:     $LOG_FILE"
+        pm2 describe "$SERVICE_NAME"
         echo ""
-        
-        # 显示进程信息
-        if command -v ps &> /dev/null; then
-            echo "进程信息:"
-            ps -p "$pid" -o pid,ppid,user,%cpu,%mem,etime,cmd 2>/dev/null
-        fi
         
         # 检查端口
         if command -v ss &> /dev/null; then
-            echo ""
             echo "端口监听:"
             ss -tlnp 2>/dev/null | grep ":${ORCHESTRATOR_PORT}" || echo "  (未检测到端口监听)"
         elif command -v netstat &> /dev/null; then
-            echo ""
             echo "端口监听:"
             netstat -tlnp 2>/dev/null | grep ":${ORCHESTRATOR_PORT}" || echo "  (未检测到端口监听)"
         fi
@@ -241,40 +303,47 @@ show_status() {
 
 # 查看日志
 show_logs() {
-    if [ -f "$LOG_FILE" ]; then
-        print_info "显示日志 (最后 50 行):"
-        echo "----------------------------------------"
-        tail -50 "$LOG_FILE"
-        echo "----------------------------------------"
-        print_info "实时日志: tail -f $LOG_FILE"
-    else
-        print_warning "日志文件不存在: $LOG_FILE"
-    fi
+    check_pm2
+    
+    print_info "显示日志 (最后 50 行):"
+    pm2 logs "$SERVICE_NAME" --lines 50 --nostream
 }
 
 # 实时日志
 follow_logs() {
-    if [ -f "$LOG_FILE" ]; then
-        print_info "实时日志 (Ctrl+C 退出):"
-        tail -f "$LOG_FILE"
-    else
-        print_warning "日志文件不存在: $LOG_FILE"
-    fi
+    check_pm2
+    
+    print_info "实时日志 (Ctrl+C 退出):"
+    pm2 logs "$SERVICE_NAME"
+}
+
+# 打开监控面板
+show_monit() {
+    check_pm2
+    pm2 monit
+}
+
+# 显示所有 PM2 进程
+show_list() {
+    check_pm2
+    pm2 list
 }
 
 # 显示帮助
 show_help() {
     echo ""
-    echo "Orchestrator Service 启动脚本"
+    echo "Orchestrator Service 启动脚本 (PM2 版本)"
     echo ""
     echo "使用方法:"
-    echo "  $0                    前台运行服务"
-    echo "  $0 --daemon, -d       后台运行服务"
+    echo "  $0                    使用 PM2 启动服务"
     echo "  $0 --stop             停止服务"
     echo "  $0 --restart          重启服务"
+    echo "  $0 --reload           重载服务 (零停机)"
     echo "  $0 --status           查看服务状态"
     echo "  $0 --logs             查看日志 (最后 50 行)"
     echo "  $0 --follow, -f       实时查看日志"
+    echo "  $0 --monit            打开 PM2 监控面板"
+    echo "  $0 --list             显示所有 PM2 进程"
     echo "  $0 --help, -h         显示帮助"
     echo ""
     echo "环境变量:"
@@ -286,28 +355,38 @@ show_help() {
     echo "  LLM_API_BASE_URL      LLM API 地址"
     echo "  LLM_MODEL             LLM 模型名称"
     echo ""
+    echo "PM2 常用命令:"
+    echo "  pm2 status            查看所有进程状态"
+    echo "  pm2 logs              查看所有日志"
+    echo "  pm2 monit             打开监控面板"
+    echo "  pm2 save              保存进程列表"
+    echo "  pm2 startup           设置开机自启"
+    echo ""
     echo "示例:"
-    echo "  # 前台运行"
+    echo "  # 启动服务"
     echo "  ./start_orchestrator.sh"
     echo ""
-    echo "  # 后台运行并指定端口"
-    echo "  ORCHESTRATOR_PORT=9000 ./start_orchestrator.sh --daemon"
+    echo "  # 指定端口启动"
+    echo "  ORCHESTRATOR_PORT=9000 ./start_orchestrator.sh"
     echo ""
-    echo "  # 查看状态"
-    echo "  ./start_orchestrator.sh --status"
+    echo "  # 查看实时日志"
+    echo "  ./start_orchestrator.sh --follow"
+    echo ""
+    echo "  # 设置开机自启"
+    echo "  pm2 save && pm2 startup"
     echo ""
 }
 
 # 主入口
 case "${1:-}" in
-    --daemon|-d)
-        start_daemon
-        ;;
     --stop)
         stop_service
         ;;
     --restart)
         restart_service
+        ;;
+    --reload)
+        reload_service
         ;;
     --status)
         show_status
@@ -318,11 +397,17 @@ case "${1:-}" in
     --follow|-f)
         follow_logs
         ;;
+    --monit)
+        show_monit
+        ;;
+    --list)
+        show_list
+        ;;
     --help|-h)
         show_help
         ;;
     "")
-        start_foreground
+        start_service
         ;;
     *)
         print_error "未知参数: $1"
