@@ -201,14 +201,16 @@ start_daemon() {
 start_with_pm2() {
     print_info "使用 PM2 启动服务..."
     
-    # 检查是否已经在 PM2 中运行
+    # 先停止已有的 PM2 进程
     if pm2 list | grep -q "$SERVICE_NAME"; then
-        print_warning "服务已在 PM2 中运行"
-        pm2 restart "$SERVICE_NAME"
-        print_success "服务已重启"
-    else
-        # 创建 PM2 配置文件
-        cat > "${SCRIPT_DIR}/ecosystem.config.js" << EOF
+        print_info "停止已有的 PM2 进程..."
+        pm2 stop "$SERVICE_NAME" 2>/dev/null || true
+        pm2 delete "$SERVICE_NAME" 2>/dev/null || true
+        sleep 1
+    fi
+    
+    # 创建 PM2 配置文件
+    cat > "${SCRIPT_DIR}/ecosystem.config.js" << EOF
 module.exports = {
   apps: [{
     name: '${SERVICE_NAME}',
@@ -239,10 +241,10 @@ module.exports = {
   }]
 };
 EOF
-        
-        pm2 start "${SCRIPT_DIR}/ecosystem.config.js"
-        print_success "服务已通过 PM2 启动"
-    fi
+    
+    # 启动服务
+    pm2 start "${SCRIPT_DIR}/ecosystem.config.js"
+    print_success "服务已通过 PM2 启动"
     
     pm2 save
     
