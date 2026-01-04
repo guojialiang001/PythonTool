@@ -145,7 +145,19 @@ class HTTPProxyClient:
                 if k.lower() not in skip_headers
             }
         
-        logger.info(f"转发 HTTP 请求: {method} -> {Config.BACKEND_HTTP_URL}{path}")
+        logger.info(f"=" * 60)
+        logger.info(f"[HTTP 请求] 转发到后端")
+        logger.info(f"  方法: {method}")
+        logger.info(f"  URL: {Config.BACKEND_HTTP_URL}{path}")
+        logger.info(f"  请求头: {forward_headers}")
+        if body:
+            try:
+                body_preview = body.decode('utf-8')[:500] if len(body) > 500 else body.decode('utf-8')
+                logger.info(f"  请求体: {body_preview}")
+            except:
+                logger.info(f"  请求体: [二进制数据, 长度: {len(body)}]")
+        if params:
+            logger.info(f"  查询参数: {params}")
         
         try:
             response = await self._client.request(
@@ -156,17 +168,36 @@ class HTTPProxyClient:
                 params=params
             )
             
-            logger.info(f"后端响应: {response.status_code}")
+            logger.info(f"[HTTP 响应] 后端返回")
+            logger.info(f"  状态码: {response.status_code}")
+            logger.info(f"  响应头: {dict(response.headers)}")
+            try:
+                response_preview = response.text[:1000] if len(response.text) > 1000 else response.text
+                logger.info(f"  响应体: {response_preview}")
+            except:
+                logger.info(f"  响应体: [无法解析, 长度: {len(response.content)}]")
+            logger.info(f"=" * 60)
             return response
             
-        except httpx.TimeoutException:
-            logger.error(f"请求超时: {path}")
+        except httpx.TimeoutException as e:
+            logger.error(f"[HTTP 错误] 请求超时")
+            logger.error(f"  路径: {path}")
+            logger.error(f"  超时时间: {Config.HTTP_TIMEOUT}秒")
+            logger.error(f"  错误详情: {e}")
+            logger.info(f"=" * 60)
             raise HTTPException(status_code=504, detail="后端服务超时")
-        except httpx.ConnectError:
-            logger.error(f"无法连接后端: {Config.BACKEND_HTTP_URL}")
+        except httpx.ConnectError as e:
+            logger.error(f"[HTTP 错误] 无法连接后端")
+            logger.error(f"  后端地址: {Config.BACKEND_HTTP_URL}")
+            logger.error(f"  错误详情: {e}")
+            logger.info(f"=" * 60)
             raise HTTPException(status_code=502, detail="无法连接后端服务")
         except Exception as e:
-            logger.error(f"转发请求失败: {e}")
+            logger.error(f"[HTTP 错误] 转发请求失败")
+            logger.error(f"  路径: {path}")
+            logger.error(f"  错误类型: {type(e).__name__}")
+            logger.error(f"  错误详情: {e}")
+            logger.info(f"=" * 60)
             raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -203,7 +234,10 @@ class WebSocketProxy:
         if query_string:
             backend_url = f"{backend_url}?{query_string}"
         
-        logger.info(f"代理 WebSocket 连接 -> {backend_url}")
+        logger.info(f"=" * 60)
+        logger.info(f"[WebSocket 连接] 建立代理连接")
+        logger.info(f"  后端 URL: {backend_url}")
+        logger.info(f"  查询参数: {query_string}")
         
         # 接受客户端连接
         await client_ws.accept()
@@ -220,7 +254,8 @@ class WebSocketProxy:
                 close_timeout=10
             )
             
-            logger.info(f"已连接到后端 WebSocket: {backend_url}")
+            logger.info(f"[WebSocket 连接] 成功连接到后端")
+            logger.info(f"  后端 URL: {backend_url}")
             
             # 创建双向转发任务
             client_to_backend = asyncio.create_task(
@@ -245,21 +280,29 @@ class WebSocketProxy:
                     pass
             
         except websockets.exceptions.InvalidStatusCode as e:
-            logger.error(f"后端 WebSocket 连接被拒绝: {e.status_code}")
+            logger.error(f"[WebSocket 错误] 后端连接被拒绝")
+            logger.error(f"  状态码: {e.status_code}")
+            logger.error(f"  后端 URL: {backend_url}")
             try:
                 await client_ws.close(code=1002, reason=f"后端拒绝连接: {e.status_code}")
             except:
                 pass
         except websockets.exceptions.ConnectionClosed as e:
-            logger.info(f"后端 WebSocket 连接关闭: {e.code} {e.reason}")
-        except ConnectionRefusedError:
-            logger.error(f"无法连接到后端 WebSocket: {backend_url}")
+            logger.info(f"[WebSocket 关闭] 后端连接关闭")
+            logger.info(f"  关闭码: {e.code}")
+            logger.info(f"  原因: {e.reason}")
+        except ConnectionRefusedError as e:
+            logger.error(f"[WebSocket 错误] 无法连接到后端")
+            logger.error(f"  后端 URL: {backend_url}")
+            logger.error(f"  错误详情: {e}")
             try:
                 await client_ws.close(code=1011, reason="无法连接后端服务")
             except:
                 pass
         except Exception as e:
-            logger.error(f"WebSocket 代理错误: {e}")
+            logger.error(f"[WebSocket 错误] 代理错误")
+            logger.error(f"  错误类型: {type(e).__name__}")
+            logger.error(f"  错误详情: {e}")
             try:
                 await client_ws.close(code=1011, reason=str(e))
             except:
@@ -271,7 +314,9 @@ class WebSocketProxy:
                     await backend_ws.close()
                 except:
                     pass
-            logger.info(f"WebSocket 代理连接已关闭，当前活跃连接: {self._active_connections}")
+            logger.info(f"[WebSocket 关闭] 代理连接已关闭")
+            logger.info(f"  当前活跃连接: {self._active_connections}")
+            logger.info(f"=" * 60)
     
     async def _forward_client_to_backend(
         self,
@@ -287,18 +332,19 @@ class WebSocketProxy:
                 if data["type"] == "websocket.receive":
                     if "text" in data:
                         await backend_ws.send(data["text"])
-                        logger.debug(f"客户端 -> 后端: {data['text'][:100]}...")
+                        logger.info(f"[WS 消息] 客户端 -> 后端")
+                        logger.info(f"  内容: {data['text'][:200]}{'...' if len(data['text']) > 200 else ''}")
                     elif "bytes" in data:
                         await backend_ws.send(data["bytes"])
-                        logger.debug(f"客户端 -> 后端: [二进制数据]")
+                        logger.info(f"[WS 消息] 客户端 -> 后端: [二进制数据, 长度: {len(data['bytes'])}]")
                 elif data["type"] == "websocket.disconnect":
-                    logger.info("客户端断开连接")
+                    logger.info("[WS 断开] 客户端主动断开连接")
                     break
                     
         except WebSocketDisconnect:
-            logger.info("客户端 WebSocket 断开")
+            logger.info("[WS 断开] 客户端 WebSocket 断开")
         except Exception as e:
-            logger.error(f"客户端到后端转发错误: {e}")
+            logger.error(f"[WS 错误] 客户端到后端转发错误: {type(e).__name__}: {e}")
     
     async def _forward_backend_to_client(
         self,
@@ -310,15 +356,16 @@ class WebSocketProxy:
             async for message in backend_ws:
                 if isinstance(message, str):
                     await client_ws.send_text(message)
-                    logger.debug(f"后端 -> 客户端: {message[:100]}...")
+                    logger.info(f"[WS 消息] 后端 -> 客户端")
+                    logger.info(f"  内容: {message[:200]}{'...' if len(message) > 200 else ''}")
                 elif isinstance(message, bytes):
                     await client_ws.send_bytes(message)
-                    logger.debug(f"后端 -> 客户端: [二进制数据]")
+                    logger.info(f"[WS 消息] 后端 -> 客户端: [二进制数据, 长度: {len(message)}]")
                     
         except websockets.exceptions.ConnectionClosed as e:
-            logger.info(f"后端 WebSocket 关闭: {e.code}")
+            logger.info(f"[WS 关闭] 后端 WebSocket 关闭: 码={e.code}")
         except Exception as e:
-            logger.error(f"后端到客户端转发错误: {e}")
+            logger.error(f"[WS 错误] 后端到客户端转发错误: {type(e).__name__}: {e}")
     
     @property
     def active_connections(self) -> int:
