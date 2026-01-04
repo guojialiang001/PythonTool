@@ -5,12 +5,12 @@ Orchestrator Proxy Service - 代理转发服务
 将请求转发到后端服务器 8.136.32.5:8000
 
 只中转以下两个请求:
-1. HTTP POST /endpoint/chat/conversations/start 
-   → http://8.136.32.5:8000/api/v1/chat/conversations/start
+1. HTTP POST /endpoint/chat/conversations/start
+   → http://8.136.32.5:8000/endpoint/chat/conversations/start
    (开始新对话，获取 Token)
 
 2. WebSocket /endpoint/ws/chat?token=<jwt_token>
-   → ws://8.136.32.5:8000/ws/chat?token=<jwt_token>
+   → ws://8.136.32.5:8000/endpoint/ws/chat?token=<jwt_token>
    (对话 WebSocket)
 
 部署方式:
@@ -22,7 +22,7 @@ Orchestrator Proxy Service - 代理转发服务
     BACKEND_HOST - 后端服务器地址 (默认: 8.136.32.5)
     BACKEND_PORT - 后端服务器端口 (默认: 8000)
     ENDPOINT_PREFIX - 本地端点前缀 (默认: /endpoint)
-    BACKEND_API_PREFIX - 后端 API 前缀 (默认: /api/v1)
+    BACKEND_API_PREFIX - 后端 API 前缀 (默认: /endpoint)
     LOG_LEVEL - 日志级别 (默认: INFO)
 """
 
@@ -65,7 +65,7 @@ class Config:
     
     # 路径前缀配置
     ENDPOINT_PREFIX = os.getenv("ENDPOINT_PREFIX", "/endpoint")  # 本地端点前缀
-    BACKEND_API_PREFIX = os.getenv("BACKEND_API_PREFIX", "/api/v1")  # 后端 API 前缀
+    BACKEND_API_PREFIX = os.getenv("BACKEND_API_PREFIX", "/endpoint")  # 后端 API 前缀
     
     # 后端 URL
     BACKEND_HTTP_URL = f"http://{BACKEND_HOST}:{BACKEND_PORT}"
@@ -422,6 +422,30 @@ app.add_middleware(
 
 
 # ============================================================================
+# 请求日志中间件
+# ============================================================================
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """记录所有 HTTP 请求"""
+    logger.info(f"=" * 60)
+    logger.info(f"[收到请求]")
+    logger.info(f"  方法: {request.method}")
+    logger.info(f"  路径: {request.url.path}")
+    logger.info(f"  查询参数: {request.query_params}")
+    logger.info(f"  客户端: {request.client.host if request.client else 'unknown'}")
+    logger.info(f"  请求头: {dict(request.headers)}")
+    
+    response = await call_next(request)
+    
+    logger.info(f"[响应]")
+    logger.info(f"  状态码: {response.status_code}")
+    logger.info(f"=" * 60)
+    
+    return response
+
+
+# ============================================================================
 # 基础路由
 # ============================================================================
 
@@ -453,8 +477,8 @@ async def root():
                 "type": "WebSocket",
                 "local_path": f"{Config.ENDPOINT_PREFIX}/ws/chat",
                 "params": "?token=<jwt_token>",
-                "backend_path": "/ws/chat",
-                "backend_url": f"{Config.BACKEND_WS_URL}/ws/chat?token=<jwt_token>",
+                "backend_path": f"{Config.BACKEND_API_PREFIX}/ws/chat",
+                "backend_url": f"{Config.BACKEND_WS_URL}{Config.BACKEND_API_PREFIX}/ws/chat?token=<jwt_token>",
                 "description": "对话 WebSocket",
                 "auth_required": True
             }
@@ -498,6 +522,21 @@ proxy_router = APIRouter(prefix=Config.ENDPOINT_PREFIX, tags=["proxy"])
 
 
 # ----------------------------------------------------------------------------
+# 路由: /endpoint/ - 禁用（返回 403）
+# ----------------------------------------------------------------------------
+
+@proxy_router.api_route("/", methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def endpoint_disabled():
+    """
+    端点根路径已禁用
+    
+    本地路径: {ENDPOINT_PREFIX}/
+    """
+    logger.warning(f"[禁止访问] 尝试访问 {Config.ENDPOINT_PREFIX}/")
+    raise HTTPException(status_code=403, detail="此端点已禁用")
+
+
+# ----------------------------------------------------------------------------
 # 路由 #1: HTTP POST - 开始新对话，获取 Token
 # ----------------------------------------------------------------------------
 
@@ -511,7 +550,7 @@ async def proxy_start_conversation(request: Request):
     
     示例:
         本地: POST /endpoint/chat/conversations/start
-        后端: POST http://8.136.32.5:8000/api/v1/chat/conversations/start
+        后端: POST http://8.136.32.5:8000/endpoint/chat/conversations/start
     
     认证: 否
     """
@@ -554,11 +593,11 @@ async def proxy_ws_chat(websocket: WebSocket):
     代理路由 #2: 对话 WebSocket
     
     本地路径: WS {ENDPOINT_PREFIX}/ws/chat?token=<jwt_token>
-    后端路径: WS /ws/chat?token=<jwt_token>
+    后端路径: WS {BACKEND_API_PREFIX}/ws/chat?token=<jwt_token>
     
     示例:
         本地: ws://localhost:8001/endpoint/ws/chat?token=xxx
-        后端: ws://8.136.32.5:8000/ws/chat?token=xxx
+        后端: ws://8.136.32.5:8000/endpoint/ws/chat?token=xxx
     
     认证: 是 (通过 token 参数)
     """
@@ -569,12 +608,15 @@ async def proxy_ws_chat(websocket: WebSocket):
     # 获取查询参数
     query_string = str(websocket.query_params)
     
-    logger.info(f"[路由#2] WS {Config.ENDPOINT_PREFIX}/ws/chat -> /ws/chat (params: {query_string})")
+    # 构建后端 WebSocket 路径
+    backend_ws_path = f"{Config.BACKEND_API_PREFIX}/ws/chat"
+    
+    logger.info(f"[路由#2] WS {Config.ENDPOINT_PREFIX}/ws/chat -> {backend_ws_path} (params: {query_string})")
     
     # 代理 WebSocket 连接
     await ws_proxy.proxy_websocket(
         client_ws=websocket,
-        backend_path="/ws/chat",
+        backend_path=backend_ws_path,
         query_string=query_string
     )
 
@@ -610,7 +652,7 @@ if __name__ == "__main__":
 ║                                                                             ║
 ║  #2 WebSocket (对话 WebSocket) [需要认证]:                                  ║
 ║     本地: WS {Config.ENDPOINT_PREFIX}/ws/chat?token=<jwt_token>
-║     后端: WS {Config.BACKEND_WS_URL}/ws/chat?token=<jwt_token>
+║     后端: WS {Config.BACKEND_WS_URL}{Config.BACKEND_API_PREFIX}/ws/chat?token=<jwt_token>
 ╠════════════════════════════════════════════════════════════════════════════╣
 ║  测试:                                                                      ║
 ║    - 健康检查: curl http://localhost:{Config.PROXY_PORT}/health
