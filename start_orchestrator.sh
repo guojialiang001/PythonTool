@@ -3,13 +3,13 @@
 # ============================================================================
 # Orchestrator Proxy Service 启动脚本 (Linux)
 #
-# 代理转发服务，只中转以下两个请求到后端 8.136.32.5:8000
+# 代理转发服务，只中转以下两个请求到后端 8.136.32.51:8000
 #
 # 转发规则:
 #   #1 HTTP:  POST /endpoint/chat/conversations/start
-#             -> http://8.136.32.5:8000/endpoint/chat/conversations/start
+#             -> http://8.136.32.51:8000/endpoint/chat/conversations/start
 #   #2 WS:    /endpoint/ws/chat?token=xxx
-#             -> ws://8.136.32.5:8000/endpoint/ws/chat?token=xxx
+#             -> ws://8.136.32.51:8000/endpoint/ws/chat?token=xxx
 #
 # 使用方法:
 #   ./start_orchestrator.sh              # 前台启动
@@ -40,7 +40,7 @@ PID_FILE="${LOG_DIR}/${SERVICE_NAME}.pid"
 # 环境变量配置
 export PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
 export PROXY_PORT="${PROXY_PORT:-8001}"
-export BACKEND_HOST="${BACKEND_HOST:-8.136.32.5}"
+export BACKEND_HOST="${BACKEND_HOST:-8.136.32.51}"
 export BACKEND_PORT="${BACKEND_PORT:-8000}"
 export ENDPOINT_PREFIX="${ENDPOINT_PREFIX:-/endpoint}"
 export BACKEND_API_PREFIX="${BACKEND_API_PREFIX:-/endpoint}"
@@ -458,7 +458,7 @@ show_help() {
     echo "环境变量:"
     echo "  PROXY_HOST         代理监听地址 (默认: 0.0.0.0)"
     echo "  PROXY_PORT         代理监听端口 (默认: 8001)"
-    echo "  BACKEND_HOST       后端服务器地址 (默认: 8.136.32.5)"
+    echo "  BACKEND_HOST       后端服务器地址 (默认: 8.136.32.51)"
     echo "  BACKEND_PORT       后端服务器端口 (默认: 8000)"
     echo "  ENDPOINT_PREFIX    本地端点前缀 (默认: /endpoint)"
     echo "  BACKEND_API_PREFIX 后端 API 前缀 (默认: /endpoint)"

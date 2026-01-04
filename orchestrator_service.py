@@ -2,15 +2,15 @@
 """
 Orchestrator Proxy Service - 代理转发服务
 
-将请求转发到后端服务器 8.136.32.5:8000
+将请求转发到后端服务器 8.136.32.51:8000
 
 只中转以下两个请求:
 1. HTTP POST /endpoint/chat/conversations/start
-   → http://8.136.32.5:8000/endpoint/chat/conversations/start
+   → http://8.136.32.51:8000/endpoint/chat/conversations/start
    (开始新对话，获取 Token)
 
 2. WebSocket /endpoint/ws/chat?token=<jwt_token>
-   → ws://8.136.32.5:8000/endpoint/ws/chat?token=<jwt_token>
+   → ws://8.136.32.51:8000/endpoint/ws/chat?token=<jwt_token>
    (对话 WebSocket)
 
 部署方式:
@@ -19,7 +19,7 @@ Orchestrator Proxy Service - 代理转发服务
 环境变量:
     PROXY_HOST - 代理服务监听地址 (默认: 0.0.0.0)
     PROXY_PORT - 代理服务监听端口 (默认: 8001)
-    BACKEND_HOST - 后端服务器地址 (默认: 8.136.32.5)
+    BACKEND_HOST - 后端服务器地址 (默认: 8.136.32.51)
     BACKEND_PORT - 后端服务器端口 (默认: 8000)
     ENDPOINT_PREFIX - 本地端点前缀 (默认: /endpoint)
     BACKEND_API_PREFIX - 后端 API 前缀 (默认: /endpoint)
@@ -60,7 +60,7 @@ class Config:
     PROXY_PORT = int(os.getenv("PROXY_PORT", "8001"))
     
     # 后端服务器配置
-    BACKEND_HOST = os.getenv("BACKEND_HOST", "8.136.32.5")
+    BACKEND_HOST = os.getenv("BACKEND_HOST", "8.136.32.51")
     BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
     
     # 路径前缀配置
@@ -550,7 +550,7 @@ async def proxy_start_conversation(request: Request):
     
     示例:
         本地: POST /endpoint/chat/conversations/start
-        后端: POST http://8.136.32.5:8000/endpoint/chat/conversations/start
+        后端: POST http://8.136.32.51:8000/endpoint/chat/conversations/start
     
     认证: 否
     """
@@ -597,7 +597,7 @@ async def proxy_ws_chat(websocket: WebSocket):
     
     示例:
         本地: ws://localhost:8001/endpoint/ws/chat?token=xxx
-        后端: ws://8.136.32.5:8000/endpoint/ws/chat?token=xxx
+        后端: ws://8.136.32.51:8000/endpoint/ws/chat?token=xxx
     
     认证: 是 (通过 token 参数)
     """
