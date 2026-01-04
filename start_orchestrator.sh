@@ -162,6 +162,58 @@ check_pm2() {
     fi
 }
 
+# 清理占用端口的进程
+kill_port_process() {
+    local port=$1
+    print_info "检查端口 ${port} 占用情况..."
+    
+    # 查找占用端口的进程
+    local pids=$(lsof -t -i:${port} 2>/dev/null || netstat -tlnp 2>/dev/null | grep ":${port}" | awk '{print $7}' | cut -d'/' -f1 | grep -v '-')
+    
+    if [ -n "$pids" ]; then
+        print_warning "端口 ${port} 被以下进程占用: $pids"
+        for pid in $pids; do
+            if [ -n "$pid" ] && [ "$pid" != "-" ]; then
+                print_info "终止进程 PID: $pid"
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 1
+        print_success "端口 ${port} 已清理"
+    else
+        print_info "端口 ${port} 未被占用"
+    fi
+}
+
+# 清理 PM2 同名进程
+cleanup_pm2_process() {
+    if check_pm2; then
+        if pm2 list 2>/dev/null | grep -q "$SERVICE_NAME"; then
+            print_info "清理 PM2 中的同名进程: $SERVICE_NAME"
+            pm2 stop "$SERVICE_NAME" 2>/dev/null || true
+            pm2 delete "$SERVICE_NAME" 2>/dev/null || true
+            sleep 1
+            print_success "PM2 同名进程已清理"
+        else
+            print_info "PM2 中无同名进程"
+        fi
+    fi
+}
+
+# 启动前清理
+pre_start_cleanup() {
+    print_info "执行启动前清理..."
+    
+    # 清理 PM2 同名进程
+    cleanup_pm2_process
+    
+    # 清理端口占用
+    kill_port_process "$PROXY_PORT"
+    
+    print_success "启动前清理完成"
+    echo ""
+}
+
 # 前台启动
 start_foreground() {
     print_banner
@@ -169,10 +221,8 @@ start_foreground() {
     check_dependencies
     create_log_dir
     
-    if is_running; then
-        print_warning "服务已在运行 (PID: $(cat $PID_FILE))"
-        exit 1
-    fi
+    # 执行启动前清理
+    pre_start_cleanup
     
     print_info "启动代理服务 (前台模式)..."
     print_info "监听地址: ${PROXY_HOST}:${PROXY_PORT}"
@@ -190,6 +240,9 @@ start_daemon() {
     check_dependencies
     create_log_dir
     
+    # 执行启动前清理
+    pre_start_cleanup
+    
     if check_pm2; then
         start_with_pm2
     else
@@ -200,14 +253,6 @@ start_daemon() {
 # 使用 PM2 启动
 start_with_pm2() {
     print_info "使用 PM2 启动服务..."
-    
-    # 先停止已有的 PM2 进程
-    if pm2 list | grep -q "$SERVICE_NAME"; then
-        print_info "停止已有的 PM2 进程..."
-        pm2 stop "$SERVICE_NAME" 2>/dev/null || true
-        pm2 delete "$SERVICE_NAME" 2>/dev/null || true
-        sleep 1
-    fi
     
     # 创建 PM2 配置文件
     cat > "${SCRIPT_DIR}/ecosystem.config.js" << EOF
@@ -262,11 +307,6 @@ EOF
 # 使用 nohup 启动
 start_with_nohup() {
     print_info "使用 nohup 启动服务..."
-    
-    if is_running; then
-        print_warning "服务已在运行 (PID: $(cat $PID_FILE))"
-        exit 1
-    fi
     
     cd "$SCRIPT_DIR"
     nohup $PYTHON_CMD "$PYTHON_SCRIPT" > "${LOG_DIR}/${SERVICE_NAME}.log" 2>&1 &
