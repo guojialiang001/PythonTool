@@ -7,9 +7,9 @@
 #
 # 转发规则:
 #   #1 HTTP:  POST /endpoint/chat/conversations/start
-#             -> http://8.136.32.5:8000/api/v1/chat/conversations/start
+#             -> http://8.136.32.5:8000/endpoint/chat/conversations/start
 #   #2 WS:    /endpoint/ws/chat?token=xxx
-#             -> ws://8.136.32.5:8000/ws/chat?token=xxx
+#             -> ws://8.136.32.5:8000/endpoint/ws/chat?token=xxx
 #
 # 使用方法:
 #   ./start_orchestrator.sh              # 前台启动
@@ -43,7 +43,7 @@ export PROXY_PORT="${PROXY_PORT:-8001}"
 export BACKEND_HOST="${BACKEND_HOST:-8.136.32.5}"
 export BACKEND_PORT="${BACKEND_PORT:-8000}"
 export ENDPOINT_PREFIX="${ENDPOINT_PREFIX:-/endpoint}"
-export BACKEND_API_PREFIX="${BACKEND_API_PREFIX:-/api/v1}"
+export BACKEND_API_PREFIX="${BACKEND_API_PREFIX:-/endpoint}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 export HTTP_TIMEOUT="${HTTP_TIMEOUT:-30}"
 export WS_TIMEOUT="${WS_TIMEOUT:-60}"
@@ -85,7 +85,7 @@ print_banner() {
     echo "║      后端: POST http://${BACKEND_HOST}:${BACKEND_PORT}${BACKEND_API_PREFIX}/chat/conversations/start ║"
     echo "║  #2 WebSocket (对话):                                                       ║"
     echo "║      本地: WS ${ENDPOINT_PREFIX}/ws/chat?token=xxx                               ║"
-    echo "║      后端: WS ws://${BACKEND_HOST}:${BACKEND_PORT}/ws/chat?token=xxx             ║"
+    echo "║      后端: WS ws://${BACKEND_HOST}:${BACKEND_PORT}${BACKEND_API_PREFIX}/ws/chat?token=xxx ║"
     echo "╚════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -461,7 +461,7 @@ show_help() {
     echo "  BACKEND_HOST       后端服务器地址 (默认: 8.136.32.5)"
     echo "  BACKEND_PORT       后端服务器端口 (默认: 8000)"
     echo "  ENDPOINT_PREFIX    本地端点前缀 (默认: /endpoint)"
-    echo "  BACKEND_API_PREFIX 后端 API 前缀 (默认: /api/v1)"
+    echo "  BACKEND_API_PREFIX 后端 API 前缀 (默认: /endpoint)"
     echo "  LOG_LEVEL          日志级别 (默认: INFO)"
     echo "  HTTP_TIMEOUT       HTTP 超时秒数 (默认: 30)"
     echo "  WS_TIMEOUT         WebSocket 超时秒数 (默认: 60)"
@@ -473,7 +473,7 @@ show_help() {
     echo ""
     echo "  #2 WebSocket (对话):"
     echo "     本地: WS \${ENDPOINT_PREFIX}/ws/chat?token=<jwt_token>"
-    echo "     后端: WS ws://\${BACKEND_HOST}:\${BACKEND_PORT}/ws/chat?token=<jwt_token>"
+    echo "     后端: WS ws://\${BACKEND_HOST}:\${BACKEND_PORT}\${BACKEND_API_PREFIX}/ws/chat?token=<jwt_token>"
     echo ""
     echo "示例:"
     echo "  $0                              # 前台启动"
