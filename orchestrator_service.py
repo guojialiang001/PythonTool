@@ -4,7 +4,7 @@ Orchestrator Proxy Service - 代理转发服务
 
 将请求转发到后端服务器 8.136.32.51:8000
 
-只中转以下两个请求:
+中转以下请求:
 1. HTTP POST /endpoint/chat/conversations/start
    → http://8.136.32.51:8000/endpoint/chat/conversations/start
    (开始新对话，获取 Token)
@@ -12,6 +12,18 @@ Orchestrator Proxy Service - 代理转发服务
 2. WebSocket /endpoint/ws/chat?token=<jwt_token>
    → ws://8.136.32.51:8000/endpoint/ws/chat?token=<jwt_token>
    (对话 WebSocket)
+
+3. HTTP GET /endpoint/file/sandbox/{session_id}/download-workspace
+   → http://8.136.32.51:8000/endpoint/file/sandbox/{session_id}/download-workspace
+   (下载整个工作区，ZIP 格式)
+
+4. HTTP GET /endpoint/file/sandbox/{session_id}/download
+   → http://8.136.32.51:8000/endpoint/file/sandbox/{session_id}/download
+   (下载单个文件)
+
+5. HTTP GET /endpoint/file/sandbox/{session_id}/download-directory
+   → http://8.136.32.51:8000/endpoint/file/sandbox/{session_id}/download-directory
+   (下载指定目录，ZIP 格式)
 
 部署方式:
     python orchestrator_service.py
@@ -481,6 +493,39 @@ async def root():
                 "backend_url": f"{Config.BACKEND_WS_URL}{Config.BACKEND_API_PREFIX}/ws/chat?token=<jwt_token>",
                 "description": "对话 WebSocket",
                 "auth_required": True
+            },
+            {
+                "id": 3,
+                "type": "HTTP",
+                "method": "GET",
+                "local_path": f"{Config.ENDPOINT_PREFIX}/file/sandbox/{{session_id}}/download-workspace",
+                "params": "?path=/home/sandbox/workspace",
+                "backend_path": f"{Config.BACKEND_API_PREFIX}/file/sandbox/{{session_id}}/download-workspace",
+                "backend_url": f"{Config.BACKEND_HTTP_URL}{Config.BACKEND_API_PREFIX}/file/sandbox/{{session_id}}/download-workspace",
+                "description": "下载整个工作区 (ZIP 格式)",
+                "auth_required": True
+            },
+            {
+                "id": 4,
+                "type": "HTTP",
+                "method": "GET",
+                "local_path": f"{Config.ENDPOINT_PREFIX}/file/sandbox/{{session_id}}/download",
+                "params": "?path=/workspace/vue3-project/index.html",
+                "backend_path": f"{Config.BACKEND_API_PREFIX}/file/sandbox/{{session_id}}/download",
+                "backend_url": f"{Config.BACKEND_HTTP_URL}{Config.BACKEND_API_PREFIX}/file/sandbox/{{session_id}}/download",
+                "description": "下载单个文件",
+                "auth_required": True
+            },
+            {
+                "id": 5,
+                "type": "HTTP",
+                "method": "GET",
+                "local_path": f"{Config.ENDPOINT_PREFIX}/file/sandbox/{{session_id}}/download-directory",
+                "params": "?path=/home/sandbox/workspace/vue3-project",
+                "backend_path": f"{Config.BACKEND_API_PREFIX}/file/sandbox/{{session_id}}/download-directory",
+                "backend_url": f"{Config.BACKEND_HTTP_URL}{Config.BACKEND_API_PREFIX}/file/sandbox/{{session_id}}/download-directory",
+                "description": "下载指定目录 (ZIP 格式)",
+                "auth_required": True
             }
         ],
         "status": {
@@ -591,33 +636,172 @@ async def proxy_start_conversation(request: Request):
 async def proxy_ws_chat(websocket: WebSocket):
     """
     代理路由 #2: 对话 WebSocket
-    
+
     本地路径: WS {ENDPOINT_PREFIX}/ws/chat?token=<jwt_token>
     后端路径: WS {BACKEND_API_PREFIX}/ws/chat?token=<jwt_token>
-    
+
     示例:
         本地: ws://localhost:8001/endpoint/ws/chat?token=xxx
         后端: ws://8.136.32.51:8000/endpoint/ws/chat?token=xxx
-    
+
     认证: 是 (通过 token 参数)
     """
     if not ws_proxy:
         await websocket.close(code=1011, reason="代理服务未初始化")
         return
-    
+
     # 获取查询参数
     query_string = str(websocket.query_params)
-    
+
     # 构建后端 WebSocket 路径
     backend_ws_path = f"{Config.BACKEND_API_PREFIX}/ws/chat"
-    
+
     logger.info(f"[路由#2] WS {Config.ENDPOINT_PREFIX}/ws/chat -> {backend_ws_path} (params: {query_string})")
-    
+
     # 代理 WebSocket 连接
     await ws_proxy.proxy_websocket(
         client_ws=websocket,
         backend_path=backend_ws_path,
         query_string=query_string
+    )
+
+
+# ----------------------------------------------------------------------------
+# 路由 #3: GET - 下载整个工作区 (ZIP 格式)
+# ----------------------------------------------------------------------------
+
+@proxy_router.get("/file/sandbox/{session_id}/download-workspace")
+async def proxy_download_workspace(session_id: str, request: Request):
+    """
+    代理路由 #3: 下载整个工作区 (ZIP 格式)
+
+    本地路径: GET {ENDPOINT_PREFIX}/file/sandbox/{session_id}/download-workspace
+    后端路径: GET {BACKEND_API_PREFIX}/file/sandbox/{session_id}/download-workspace
+
+    示例:
+        GET /endpoint/file/sandbox/{session_id}/download-workspace
+        GET /endpoint/file/sandbox/{session_id}/download-workspace?path=/home/sandbox/workspace
+
+    认证: 是 (根据后端要求)
+    """
+    if not http_proxy:
+        raise HTTPException(status_code=503, detail="代理服务未初始化")
+
+    # 获取请求头和查询参数
+    headers = dict(request.headers)
+    params = dict(request.query_params)
+
+    # 构建后端路径
+    backend_path = f"{Config.BACKEND_API_PREFIX}/file/sandbox/{session_id}/download-workspace"
+
+    logger.info(f"[路由#3] GET {Config.ENDPOINT_PREFIX}/file/sandbox/{session_id}/download-workspace -> {backend_path}")
+
+    # 转发请求
+    response = await http_proxy.forward_request(
+        method="GET",
+        path=backend_path,
+        headers=headers,
+        params=params
+    )
+
+    # 返回后端响应
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        media_type=response.headers.get("content-type")
+    )
+
+
+# ----------------------------------------------------------------------------
+# 路由 #4: GET - 下载单个文件
+# ----------------------------------------------------------------------------
+
+@proxy_router.get("/file/sandbox/{session_id}/download")
+async def proxy_download_file(session_id: str, request: Request):
+    """
+    代理路由 #4: 下载单个文件
+
+    本地路径: GET {ENDPOINT_PREFIX}/file/sandbox/{session_id}/download
+    后端路径: GET {BACKEND_API_PREFIX}/file/sandbox/{session_id}/download
+
+    示例:
+        GET /endpoint/file/sandbox/{session_id}/download?path=/workspace/vue3-project/index.html
+
+    认证: 是 (根据后端要求)
+    """
+    if not http_proxy:
+        raise HTTPException(status_code=503, detail="代理服务未初始化")
+
+    # 获取请求头和查询参数
+    headers = dict(request.headers)
+    params = dict(request.query_params)
+
+    # 构建后端路径
+    backend_path = f"{Config.BACKEND_API_PREFIX}/file/sandbox/{session_id}/download"
+
+    logger.info(f"[路由#4] GET {Config.ENDPOINT_PREFIX}/file/sandbox/{session_id}/download -> {backend_path}")
+
+    # 转发请求
+    response = await http_proxy.forward_request(
+        method="GET",
+        path=backend_path,
+        headers=headers,
+        params=params
+    )
+
+    # 返回后端响应
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        media_type=response.headers.get("content-type")
+    )
+
+
+# ----------------------------------------------------------------------------
+# 路由 #5: GET - 下载指定目录 (ZIP 格式)
+# ----------------------------------------------------------------------------
+
+@proxy_router.get("/file/sandbox/{session_id}/download-directory")
+async def proxy_download_directory(session_id: str, request: Request):
+    """
+    代理路由 #5: 下载指定目录 (ZIP 格式)
+
+    本地路径: GET {ENDPOINT_PREFIX}/file/sandbox/{session_id}/download-directory
+    后端路径: GET {BACKEND_API_PREFIX}/file/sandbox/{session_id}/download-directory
+
+    示例:
+        GET /endpoint/file/sandbox/{session_id}/download-directory?path=/home/sandbox/workspace/vue3-project
+
+    认证: 是 (根据后端要求)
+    """
+    if not http_proxy:
+        raise HTTPException(status_code=503, detail="代理服务未初始化")
+
+    # 获取请求头和查询参数
+    headers = dict(request.headers)
+    params = dict(request.query_params)
+
+    # 构建后端路径
+    backend_path = f"{Config.BACKEND_API_PREFIX}/file/sandbox/{session_id}/download-directory"
+
+    logger.info(f"[路由#5] GET {Config.ENDPOINT_PREFIX}/file/sandbox/{session_id}/download-directory -> {backend_path}")
+
+    # 转发请求
+    response = await http_proxy.forward_request(
+        method="GET",
+        path=backend_path,
+        headers=headers,
+        params=params
+    )
+
+    # 返回后端响应
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        media_type=response.headers.get("content-type")
     )
 
 
@@ -636,7 +820,7 @@ if __name__ == "__main__":
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║        Orchestrator Proxy Service v1.0 - 代理转发服务                      ║
 ╠════════════════════════════════════════════════════════════════════════════╣
-║  说明: 只中转以下两个指定请求                                               ║
+║  说明: 中转指定的请求到后端服务器                                           ║
 ╠════════════════════════════════════════════════════════════════════════════╣
 ║  配置:                                                                      ║
 ║    - 监听地址: {Config.PROXY_HOST}:{Config.PROXY_PORT}
@@ -653,6 +837,18 @@ if __name__ == "__main__":
 ║  #2 WebSocket (对话 WebSocket) [需要认证]:                                  ║
 ║     本地: WS {Config.ENDPOINT_PREFIX}/ws/chat?token=<jwt_token>
 ║     后端: WS {Config.BACKEND_WS_URL}{Config.BACKEND_API_PREFIX}/ws/chat?token=<jwt_token>
+║                                                                             ║
+║  #3 HTTP GET (下载整个工作区，ZIP 格式) [需要认证]:                         ║
+║     本地: GET {Config.ENDPOINT_PREFIX}/file/sandbox/{{session_id}}/download-workspace
+║     后端: GET {Config.BACKEND_HTTP_URL}{Config.BACKEND_API_PREFIX}/file/sandbox/{{session_id}}/download-workspace
+║                                                                             ║
+║  #4 HTTP GET (下载单个文件) [需要认证]:                                     ║
+║     本地: GET {Config.ENDPOINT_PREFIX}/file/sandbox/{{session_id}}/download
+║     后端: GET {Config.BACKEND_HTTP_URL}{Config.BACKEND_API_PREFIX}/file/sandbox/{{session_id}}/download
+║                                                                             ║
+║  #5 HTTP GET (下载指定目录，ZIP 格式) [需要认证]:                           ║
+║     本地: GET {Config.ENDPOINT_PREFIX}/file/sandbox/{{session_id}}/download-directory
+║     后端: GET {Config.BACKEND_HTTP_URL}{Config.BACKEND_API_PREFIX}/file/sandbox/{{session_id}}/download-directory
 ╠════════════════════════════════════════════════════════════════════════════╣
 ║  测试:                                                                      ║
 ║    - 健康检查: curl http://localhost:{Config.PROXY_PORT}/health
