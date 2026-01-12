@@ -126,7 +126,7 @@ PROXY_CONFIG = {
     '/api/opus-backup': {'target': 'https://api.code-relay.com', 'rewrite': '/v1'},
     '/api/opus': {'target': 'https://aiai.li', 'rewrite': '/v1'},
     '/api/gemini': {'target': 'https://claude.chiddns.com', 'rewrite': '/v1'},
-    '/api/deepseek': {'target': 'https://aicodelink.top', 'rewrite': '/v1'},
+    '/api/deepseek': {'target': 'https://claude.chiddns.com', 'rewrite': '/v1'},
     '/api/sonnet-backup': {'target': 'https://cifang.xyz', 'rewrite': '/v1'},
     '/api/sonnet': {'target': 'https://aiai.li', 'rewrite': '/v1'},
     '/api/minimax': {'target': 'https://aicodelink.top', 'rewrite': '/v1'},
