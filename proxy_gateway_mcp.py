@@ -1314,13 +1314,26 @@ async def mcp_exa_handler(request: Request):
 # --- 原有代理逻辑 ---
 
 async def stream_response(response: httpx.Response, request_id: str, start_time: float) -> AsyncGenerator[bytes, None]:
+    """流式响应生成器 - 直接透传原始字节流"""
     chunk_count = 0
     total_bytes = 0
+    first_chunk = True
+    
     try:
         async for chunk in response.aiter_bytes():
+            if first_chunk:
+                logger.info(f"[{request_id}] STREAM: First chunk received, size: {len(chunk)} bytes")
+                logger.info(f"[{request_id}] STREAM: First chunk preview: {chunk[:200]}")
+                first_chunk = False
+            
             chunk_count += 1
             total_bytes += len(chunk)
+            
+            # 直接yield原始字节，不做任何处理
             yield chunk
+    except Exception as e:
+        logger.error(f"[{request_id}] STREAM: Error during streaming: {str(e)}")
+        raise
     finally:
         await response.aclose()
         logger.info(f"[{request_id}] STREAM COMPLETE: {chunk_count} chunks, {total_bytes} bytes, {time.time() - start_time:.3f}s")
@@ -1692,22 +1705,40 @@ async def proxy_handler(request: Request, path: str):
                     body = json.dumps(body_json).encode('utf-8')
 
         if is_stream:
+            logger.info(f"[{request_id}] STREAM: Starting stream request to {target_url}")
+            logger.info(f"[{request_id}] STREAM: Request headers: {dict(headers)}")
+            
             req = http_client.build_request(method, target_url, headers=headers, content=body)
             upstream_response = await http_client.send(req, stream=True)
+            
+            logger.info(f"[{request_id}] STREAM: Upstream response status: {upstream_response.status_code}")
+            logger.info(f"[{request_id}] STREAM: Upstream response headers: {dict(upstream_response.headers)}")
+            
+            # 原始 SSE 响应头
+            original_headers = dict(upstream_response.headers)
             
             response_headers = {
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
                 'X-Accel-Buffering': 'no',
+                'Content-Type': 'text/event-stream',  # 强制使用 SSE content-type
             }
-            for key in ['x-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining']:
-                if key in upstream_response.headers:
-                    response_headers[key] = upstream_response.headers[key]
+            
+            # 透传后端的关键响应头
+            for key in ['x-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-model-id']:
+                if key.lower() in [h.lower() for h in upstream_response.headers]:
+                    # 找到实际的头名
+                    for h in upstream_response.headers:
+                        if h.lower() == key.lower():
+                            response_headers[h] = upstream_response.headers[h]
+                            break
+            
+            logger.info(f"[{request_id}] STREAM: Response headers: {response_headers}")
             
             return StreamingResponse(
                 stream_response(upstream_response, request_id, start_time),
                 status_code=upstream_response.status_code,
-                media_type=upstream_response.headers.get('content-type', 'text/event-stream'),
+                media_type='text/event-stream',  # 强制使用 SSE
                 headers=response_headers
             )
         else:
