@@ -1713,9 +1713,14 @@ async def proxy_handler(request: Request, path: str):
 
         if is_stream:
             logger.info(f"[{request_id}] STREAM: Starting stream request to {target_url}")
-            logger.info(f"[{request_id}] STREAM: Request headers: {dict(headers)}")
             
-            req = http_client.build_request(method, target_url, headers=headers, content=body)
+            # 清理请求头，移除可能影响后端流式响应的头
+            stream_headers = {k: v for k, v in headers.items()
+                            if k.lower() not in ['x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-real-ip']}
+            
+            logger.info(f"[{request_id}] STREAM: Request headers: {dict(stream_headers)}")
+            
+            req = http_client.build_request(method, target_url, headers=stream_headers, content=body)
             upstream_response = await http_client.send(req, stream=True)
             
             logger.info(f"[{request_id}] STREAM: Upstream response status: {upstream_response.status_code}")
