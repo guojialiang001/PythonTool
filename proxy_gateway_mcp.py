@@ -1317,17 +1317,24 @@ async def stream_response(response: httpx.Response, request_id: str, start_time:
     """流式响应生成器 - 直接透传原始字节流"""
     chunk_count = 0
     total_bytes = 0
-    first_chunk = True
+    last_log_time = start_time
+    last_chunk_time = start_time
     
     try:
         async for chunk in response.aiter_bytes():
-            if first_chunk:
-                logger.info(f"[{request_id}] STREAM: First chunk received, size: {len(chunk)} bytes")
-                logger.info(f"[{request_id}] STREAM: First chunk preview: {chunk[:200]}")
-                first_chunk = False
-            
             chunk_count += 1
-            total_bytes += len(chunk)
+            chunk_size = len(chunk)
+            total_bytes += chunk_size
+            current_time = time.time()
+            elapsed = current_time - last_chunk_time
+            
+            # 每个 chunk 都记录日志
+            if chunk_count <= 5 or chunk_count % 10 == 0 or elapsed > 0.5:
+                logger.info(f"[{request_id}] STREAM chunk#{chunk_count}: {chunk_size} bytes, elapsed: {elapsed:.3f}s, total: {total_bytes}")
+                if chunk_count <= 3:
+                    logger.info(f"[{request_id}] STREAM chunk#{chunk_count} preview: {chunk[:100]}")
+            
+            last_chunk_time = current_time
             
             # 直接yield原始字节，不做任何处理
             yield chunk
