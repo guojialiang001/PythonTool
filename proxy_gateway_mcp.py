@@ -123,13 +123,13 @@ PROXY_CONFIG = {
     '/api/chat': {'target': 'https://api.xiaomimimo.com', 'rewrite': '/v1/chat'},
     '/api/claude': {'target': 'https://api.avoapi.com', 'rewrite': '/v1'},
     '/api/mimo': {'target': 'https://api.xiaomimimo.com', 'rewrite': '/v1'},
-    '/api/opus-backup': {'target': 'https://api.code-relay.com', 'rewrite': '/v1'},
-    '/api/opus': {'target': 'https://aiai.li', 'rewrite': '/v1'},
+    '/api/opus-backup': {'target': 'https://aicodelink.top', 'rewrite': '/v1'},
+    '/api/opus': {'target': 'https://api.code-relay.com', 'rewrite': '/v1'},
     '/api/gemini': {'target': 'https://claude.chiddns.com', 'rewrite': '/v1'},
-    '/api/deepseek': {'target': 'https://aicodelink.top', 'rewrite': '/v1'},
-    '/api/sonnet-backup': {'target': 'https://cifang.xyz', 'rewrite': '/v1'},
-    '/api/sonnet': {'target': 'https://aiai.li', 'rewrite': '/v1'},
-    '/api/minimax': {'target': 'https://aicodelink.top', 'rewrite': '/v1'},
+    '/api/deepseek': {'target': 'https://claude.chiddns.com', 'rewrite': '/v1'},
+    '/api/sonnet-backup': {'target': 'https://aicodelink.top', 'rewrite': '/v1'},
+    '/api/sonnet': {'target': 'https://api.code-relay.com', 'rewrite': '/v1'},
+    '/api/minimax': {'target': 'https://claude.chiddns.com', 'rewrite': '/v1'},
     '/api/grok': {'target': 'https://api.avoapi.com', 'rewrite': '/v1'},
     '/api/minimaxm21': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'},
     '/api/code-relay': {'target': 'https://api.code-relay.com', 'rewrite': '/v1'},
@@ -1314,13 +1314,33 @@ async def mcp_exa_handler(request: Request):
 # --- 原有代理逻辑 ---
 
 async def stream_response(response: httpx.Response, request_id: str, start_time: float) -> AsyncGenerator[bytes, None]:
+    """流式响应生成器 - 直接透传原始字节流"""
     chunk_count = 0
     total_bytes = 0
+    last_log_time = start_time
+    last_chunk_time = start_time
+    
     try:
         async for chunk in response.aiter_bytes():
             chunk_count += 1
-            total_bytes += len(chunk)
+            chunk_size = len(chunk)
+            total_bytes += chunk_size
+            current_time = time.time()
+            elapsed = current_time - last_chunk_time
+            
+            # 每个 chunk 都记录日志
+            if chunk_count <= 5 or chunk_count % 10 == 0 or elapsed > 0.5:
+                logger.info(f"[{request_id}] STREAM chunk#{chunk_count}: {chunk_size} bytes, elapsed: {elapsed:.3f}s, total: {total_bytes}")
+                if chunk_count <= 3:
+                    logger.info(f"[{request_id}] STREAM chunk#{chunk_count} preview: {chunk[:100]}")
+            
+            last_chunk_time = current_time
+            
+            # 直接yield原始字节，不做任何处理
             yield chunk
+    except Exception as e:
+        logger.error(f"[{request_id}] STREAM: Error during streaming: {str(e)}")
+        raise
     finally:
         await response.aclose()
         logger.info(f"[{request_id}] STREAM COMPLETE: {chunk_count} chunks, {total_bytes} bytes, {time.time() - start_time:.3f}s")
@@ -1692,22 +1712,45 @@ async def proxy_handler(request: Request, path: str):
                     body = json.dumps(body_json).encode('utf-8')
 
         if is_stream:
-            req = http_client.build_request(method, target_url, headers=headers, content=body)
+            logger.info(f"[{request_id}] STREAM: Starting stream request to {target_url}")
+            
+            # 清理请求头，移除可能影响后端流式响应的头
+            stream_headers = {k: v for k, v in headers.items()
+                            if k.lower() not in ['x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-real-ip']}
+            
+            logger.info(f"[{request_id}] STREAM: Request headers: {dict(stream_headers)}")
+            
+            req = http_client.build_request(method, target_url, headers=stream_headers, content=body)
             upstream_response = await http_client.send(req, stream=True)
+            
+            logger.info(f"[{request_id}] STREAM: Upstream response status: {upstream_response.status_code}")
+            logger.info(f"[{request_id}] STREAM: Upstream response headers: {dict(upstream_response.headers)}")
+            
+            # 原始 SSE 响应头
+            original_headers = dict(upstream_response.headers)
             
             response_headers = {
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
                 'X-Accel-Buffering': 'no',
+                'Content-Type': 'text/event-stream',  # 强制使用 SSE content-type
             }
-            for key in ['x-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining']:
-                if key in upstream_response.headers:
-                    response_headers[key] = upstream_response.headers[key]
+            
+            # 透传后端的关键响应头
+            for key in ['x-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-model-id']:
+                if key.lower() in [h.lower() for h in upstream_response.headers]:
+                    # 找到实际的头名
+                    for h in upstream_response.headers:
+                        if h.lower() == key.lower():
+                            response_headers[h] = upstream_response.headers[h]
+                            break
+            
+            logger.info(f"[{request_id}] STREAM: Response headers: {response_headers}")
             
             return StreamingResponse(
                 stream_response(upstream_response, request_id, start_time),
                 status_code=upstream_response.status_code,
-                media_type=upstream_response.headers.get('content-type', 'text/event-stream'),
+                media_type='text/event-stream',  # 强制使用 SSE
                 headers=response_headers
             )
         else:
