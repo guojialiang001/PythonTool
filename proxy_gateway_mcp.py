@@ -129,7 +129,7 @@ PROXY_CONFIG = {
     '/api/deepseek': {'target': 'https://claude.chiddns.com', 'rewrite': '/v1'},
     '/api/sonnet-backup': {'target': 'https://aicodelink.top', 'rewrite': '/v1'},
     '/api/sonnet': {'target': 'https://api.code-relay.com', 'rewrite': '/v1'},
-    '/api/minimax': {'target': 'https://aicodelink.top', 'rewrite': '/v1'},
+    '/api/minimax': {'target': 'https://claude.chiddns.com', 'rewrite': '/v1'},
     '/api/grok': {'target': 'https://api.avoapi.com', 'rewrite': '/v1'},
     '/api/minimaxm21': {'target': 'https://aiping.cn/api', 'rewrite': '/v1'},
     '/api/code-relay': {'target': 'https://api.code-relay.com', 'rewrite': '/v1'},
