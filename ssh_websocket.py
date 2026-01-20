@@ -1,7 +1,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 import paramiko
 import asyncio
 import threading
@@ -9,8 +9,58 @@ import json
 import time
 import os
 import re
+import base64
+import posixpath
+import stat
+import uuid
+import io
 from contextlib import asynccontextmanager
 import sys
+
+
+def _sftp_resolve_path(path_raw: str, session_id: str, ssh_manager: "SSHSessionManager") -> str:
+    """
+    Resolve a remote path for SFTP operations.
+
+    - Supports "~" expansion using ssh_manager.home_dir_cache (best effort).
+    - Resolves relative paths against ssh_manager.cwd_cache (best effort).
+    - Normalizes with POSIX semantics (remote is assumed to be Linux/Unix).
+    """
+    try:
+        path = path_raw if isinstance(path_raw, str) else str(path_raw or "")
+    except Exception:
+        path = ""
+
+    path = path.strip()
+
+    home = "/"
+    try:
+        home = ssh_manager.home_dir_cache.get(session_id, "/")
+    except Exception:
+        home = "/"
+
+    if not path:
+        return home
+
+    if path == "~":
+        path = home
+    elif path.startswith("~/"):
+        path = posixpath.join(home, path[2:])
+    elif path.startswith("~") and not path.startswith("~/"):
+        # "~user" is not supported here; treat as home-relative for safety.
+        path = posixpath.join(home, path[1:].lstrip("/"))
+    elif not path.startswith("/"):
+        base = home
+        try:
+            base = ssh_manager.cwd_cache.get(session_id, home) or home
+        except Exception:
+            base = home
+        path = posixpath.join(base, path)
+
+    path = posixpath.normpath(path)
+    if path == ".":
+        path = "/"
+    return path
 
 # 确保当前脚本所在目录在 Python 模块搜索路径中
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +91,9 @@ class SSHConnection(BaseModel):
     username: str
     password: Optional[str] = None
     key_file: Optional[str] = None
+    key_content: Optional[str] = None
+    passphrase: Optional[str] = None
+    jump: Optional[Dict[str, Any]] = None
     width: Optional[int] = 80
     height: Optional[int] = 24
 
@@ -49,10 +102,40 @@ class WebSocketMessage(BaseModel):
     type: str  # "connect", "command", "disconnect", "resize"
     data: Optional[Dict] = None
 
+
+class ManagedSSHSession:
+    """Holds the target SSH client and optional jump/bastion resources."""
+
+    def __init__(
+        self,
+        client: paramiko.SSHClient,
+        jump_client: Optional[paramiko.SSHClient] = None,
+        jump_channel: Optional[Any] = None,
+    ):
+        self.client = client
+        self.jump_client = jump_client
+        self.jump_channel = jump_channel
+
+    def close(self) -> None:
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        try:
+            if self.jump_channel is not None:
+                self.jump_channel.close()
+        except Exception:
+            pass
+        try:
+            if self.jump_client is not None:
+                self.jump_client.close()
+        except Exception:
+            pass
+
 # SSH会话管理器
 class SSHSessionManager:
     def __init__(self):
-        self.sessions: Dict[str, paramiko.SSHClient] = {}
+        self.sessions: Dict[str, ManagedSSHSession] = {}
         self.websocket_connections: Dict[str, WebSocket] = {}
         self.command_history: Dict[str, list] = {}  # 存储每个会话的命令历史
         self.cwd_cache: Dict[str, str] = {} # 存储每个会话的当前工作目录（猜测值）
@@ -60,7 +143,11 @@ class SSHSessionManager:
         self.lock = threading.Lock()
     
     def generate_session_id(self, connection: SSHConnection) -> str:
-        return f"{connection.username}@{connection.hostname}:{connection.port}"
+        # Must be unique per websocket connection to support multi-tab / multi-session
+        # connections to the same host/user/port.
+        suffix = uuid.uuid4().hex[:8]
+        ts = int(time.time() * 1000)
+        return f"{connection.username}@{connection.hostname}:{connection.port}#{ts}_{suffix}"
     
     def update_cwd(self, session_id: str, command: str, ssh_client: paramiko.SSHClient = None):
         """尝试从命令中更新当前工作目录"""
@@ -482,7 +569,8 @@ class SSHSessionManager:
                             "column_width": 10,
                             "total_files": 0
                         },
-                        "prompt": prompt
+                        "prompt": prompt,
+                        "currentPath": current_dir
                     }
                 }
             
@@ -517,7 +605,8 @@ class SSHSessionManager:
                 "data": {
                     "files": file_info_list,
                     "layout": multicolumn_info,
-                    "prompt": prompt
+                    "prompt": prompt,
+                    "currentPath": current_dir
                 }
             }
             
@@ -578,40 +667,99 @@ class SSHSessionManager:
             command = history[new_index] if new_index >= 0 else ""
             return {"command": command, "index": new_index}
     
-    def connect_ssh(self, connection: SSHConnection) -> paramiko.SSHClient:
-        session_id = self.generate_session_id(connection)
-        
+    def connect_ssh(self, session_id: str, connection: SSHConnection) -> paramiko.SSHClient:
+        """Create (or return) an SSHClient bound to a specific session_id."""
         with self.lock:
             if session_id in self.sessions:
-                return self.sessions[session_id]
+                return self.sessions[session_id].client
             
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
-            try:
-                if connection.password:
-                    ssh.connect(
-                        hostname=connection.hostname,
-                        port=connection.port,
-                        username=connection.username,
-                        password=connection.password,
-                        timeout=30  # 增加SSH连接超时时间
-                    )
-                elif connection.key_file:
-                    ssh.connect(
-                        hostname=connection.hostname,
-                        port=connection.port,
-                        username=connection.username,
-                        key_filename=connection.key_file,
-                        timeout=30  # 增加SSH连接超时时间
-                    )
+
+            def _load_pkey(key_text: str, passphrase: Optional[str] = None) -> paramiko.PKey:
+                if not key_text:
+                    raise ValueError("empty key_content")
+                buf = io.StringIO(key_text)
+                last_err: Optional[Exception] = None
+                for key_cls in (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.DSSKey):
+                    try:
+                        buf.seek(0)
+                        return key_cls.from_private_key(buf, password=passphrase)
+                    except Exception as e:
+                        last_err = e
+                        continue
+                raise ValueError(f"unsupported private key: {last_err}")
+
+            def _connect_one(client: paramiko.SSHClient, conn: SSHConnection, sock: Any = None) -> None:
+                kwargs: Dict[str, Any] = {
+                    "hostname": conn.hostname,
+                    "port": conn.port,
+                    "username": conn.username,
+                    "timeout": 30,
+                    "banner_timeout": 30,
+                    "auth_timeout": 30,
+                    # Avoid long hangs when the server has lots of SSH keys configured.
+                    "allow_agent": False,
+                    "look_for_keys": False,
+                }
+                if sock is not None:
+                    kwargs["sock"] = sock
+
+                if conn.password:
+                    kwargs["password"] = conn.password
+                elif conn.key_file:
+                    kwargs["key_filename"] = conn.key_file
+                    if conn.passphrase:
+                        kwargs["passphrase"] = conn.passphrase
+                elif conn.key_content:
+                    kwargs["pkey"] = _load_pkey(conn.key_content, conn.passphrase)
                 else:
-                    raise ValueError("Either password or key_file must be provided")
-                
-                self.sessions[session_id] = ssh
+                    raise ValueError("Either password or key_* must be provided")
+
+                client.connect(**kwargs)
+
+            try:
+                jump_client: Optional[paramiko.SSHClient] = None
+                jump_channel: Optional[Any] = None
+
+                if connection.jump:
+                    jump_conn = SSHConnection(**connection.jump)
+                    jump_client = paramiko.SSHClient()
+                    jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    _connect_one(jump_client, jump_conn)
+
+                    transport = jump_client.get_transport()
+                    if transport is None:
+                        raise Exception("jump transport not available")
+
+                    # Open a direct-tcpip channel from jump host to target host.
+                    jump_channel = transport.open_channel(
+                        "direct-tcpip",
+                        (connection.hostname, connection.port),
+                        ("127.0.0.1", 0),
+                    )
+                    _connect_one(ssh, connection, sock=jump_channel)
+                else:
+                    _connect_one(ssh, connection)
+
+                self.sessions[session_id] = ManagedSSHSession(ssh, jump_client=jump_client, jump_channel=jump_channel)
                 return ssh
                 
             except Exception as e:
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
+                try:
+                    if jump_channel is not None:
+                        jump_channel.close()
+                except Exception:
+                    pass
+                try:
+                    if jump_client is not None:
+                        jump_client.close()
+                except Exception:
+                    pass
                 raise Exception(f"SSH连接失败: {str(e)}")
     
     def disconnect_ssh(self, session_id: str):
@@ -749,7 +897,7 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         
         # 建立SSH连接
         print(f"[{client_ip}] 正在建立SSH连接: {connection.username}@{connection.hostname}:{connection.port}")
-        ssh_client = app.state.ssh_manager.connect_ssh(connection)
+        ssh_client = app.state.ssh_manager.connect_ssh(session_id, connection)
         app.state.ssh_manager.register_websocket(session_id, websocket)
         
         # 安全：记录连接成功
@@ -770,7 +918,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         connected_response = {
             "type": "connected",
             "session_id": session_id,
-            "message": "SSH连接成功"
+            "message": "SSH连接成功",
+            "data": {
+                "currentPath": app.state.ssh_manager.get_cwd(session_id)
+            }
         }
         print(f"发送connected响应: {connected_response}")
         await websocket.send_text(json.dumps(connected_response))
@@ -779,7 +930,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
         connect_response = {
             "type": "connect",
             "session_id": session_id,
-            "message": "SSH连接成功"
+            "message": "SSH连接成功",
+            "data": {
+                "currentPath": app.state.ssh_manager.get_cwd(session_id)
+            }
         }
         print(f"发送connect响应: {connect_response}")
         await websocket.send_text(json.dumps(connect_response))
@@ -867,7 +1021,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     # 丢弃该行
                                     continue
                                 filtered.append(orig)
-                            data = '\n'.join(filtered)
+                            # NOTE: Preserve raw PTY output (ANSI/VT sequences and CR/LF semantics).
+                            # Rewriting line endings here breaks full-screen apps (vim/top) and colors.
+                            # data = '\n'.join(filtered)
+                            pass
                         except Exception:
                             # 过滤异常时忽略，继续输出
                             pass
@@ -875,20 +1032,17 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         # 发送过滤后的输出
                         try:
                             data_for_send = data
-                            # 移除常见ANSI CSI颜色/样式控制序列
-                            data_for_send = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data_for_send)
-                            # 移除Bracketed Paste模式切换序列
-                            data_for_send = re.sub(r"\x1b\[\?2004[hl]", "", data_for_send)
-                            # 移除OSC (Operating System Command) 序列，如设置终端标题
-                            data_for_send = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", data_for_send)
-                            # 统一换行符
-                            data_for_send = data_for_send.replace("\r\n", "\n").replace("\r", "\n")
+                            # Keep ANSI/VT sequences so xterm.js can render colors/cursor moves/fullscreen UIs.
+                            # (No sanitization here by default.)
                         except Exception:
                             data_for_send = data
 
                         await websocket.send_text(json.dumps({
                             "type": "output",
-                            "data": data_for_send
+                            "data": {
+                                "output": data_for_send,
+                                "currentPath": app.state.ssh_manager.get_cwd(session_id)
+                            }
                         }))
                     await asyncio.sleep(0.01)
                 except:
@@ -977,7 +1131,10 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                                     # 直接发送提示符，不添加额外换行
                                     prompt_response = {
                                         "type": "output",
-                                        "data": prompt_text
+                                        "data": {
+                                            "output": prompt_text,
+                                            "currentPath": app.state.ssh_manager.get_cwd(session_id)
+                                        }
                                     }
                                     await websocket.send_text(json.dumps(prompt_response))
 
@@ -1018,6 +1175,453 @@ async def websocket_ssh_endpoint(websocket: WebSocket):
                         channel.send(command + "\n")
                         # 尝试更新CWD（传入ssh_client用于其他命令）
                         app.state.ssh_manager.update_cwd(session_id, command, ssh_client)
+                elif message["type"] == "input":
+                    # Full PTY passthrough input: forward raw keystrokes to the SSH channel.
+                    payload = ""
+                    if "data" in message:
+                        if isinstance(message["data"], dict):
+                            payload = message["data"].get("input") or message["data"].get("data") or ""
+                        elif isinstance(message["data"], str):
+                            payload = message["data"]
+                    if payload and channel:
+                        channel.send(payload)
+                elif message["type"] == "interrupt":
+                    # Ctrl+C / SIGINT
+                    if channel:
+                        channel.send(chr(3))
+                elif message["type"] == "eof":
+                    # Ctrl+D / EOF
+                    if channel:
+                        channel.send(chr(4))
+                elif message["type"] == "vim_command":
+                    # Minimal vim protocol support (mainly for save/exit flows).
+                    data = message.get("data") or {}
+                    if not isinstance(data, dict):
+                        data = {}
+                    action = data.get("action")
+
+                    if action == "raw_input":
+                        raw = data.get("input") or ""
+                        if raw and channel:
+                            channel.send(raw)
+                        continue
+
+                    if action == "save_with_content":
+                        file_name = data.get("fileName") or ""
+                        file_path = data.get("filePath") or file_name
+                        content = data.get("content") or ""
+                        encoding = data.get("encoding") or "utf-8"
+                        also_quit = bool(data.get("alsoQuit"))
+
+                        if not file_name and file_path:
+                            try:
+                                file_name = str(file_path).split("/")[-1]
+                            except Exception:
+                                file_name = ""
+
+                        if not file_path:
+                            await websocket.send_text(json.dumps({
+                                "type": "vim_save_result",
+                                "data": {
+                                    "success": False,
+                                    "fileName": file_name or "",
+                                    "filePath": "",
+                                    "error": "No file path",
+                                    "message": "E32: No file name",
+                                    "alsoQuit": False
+                                }
+                            }))
+                            continue
+
+                        try:
+                            content_bytes = str(content).encode(str(encoding), errors="replace")
+                            sftp = ssh_client.open_sftp()
+                            # Best-effort backup for safety, if requested.
+                            if data.get("createBackup"):
+                                try:
+                                    ts = int(time.time())
+                                    sftp.posix_rename(file_path, f"{file_path}.bak.{ts}")
+                                except Exception:
+                                    pass
+                            with sftp.file(file_path, "wb") as f:
+                                f.write(content_bytes)
+                            try:
+                                sftp.close()
+                            except Exception:
+                                pass
+
+                            await websocket.send_text(json.dumps({
+                                "type": "vim_save_result",
+                                "data": {
+                                    "success": True,
+                                    "fileName": file_name or "",
+                                    "filePath": file_path,
+                                    "bytesWritten": len(content_bytes),
+                                    "message": "written",
+                                    "alsoQuit": also_quit
+                                }
+                            }))
+                        except Exception as e:
+                            await websocket.send_text(json.dumps({
+                                "type": "vim_save_result",
+                                "data": {
+                                    "success": False,
+                                    "fileName": file_name or "",
+                                    "filePath": file_path,
+                                    "error": str(e),
+                                    "message": "E212: Can't open file for writing",
+                                    "alsoQuit": False
+                                }
+                            }))
+                        continue
+
+                    if action == "exit_vim":
+                        # Frontend-side vim mode exit; for a raw PTY terminal this is usually unused.
+                        await websocket.send_text(json.dumps({
+                            "type": "vim_exit_result",
+                            "data": {
+                                "success": True
+                            }
+                        }))
+                        continue
+                elif message["type"] == "sftp_list":
+                    request_id = message.get("request_id") or message.get("requestId")
+                    data = message.get("data") or {}
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    path_raw = data.get("path") or data.get("dir") or "~"
+                    path = _sftp_resolve_path(path_raw, session_id, app.state.ssh_manager)
+
+                    try:
+                        sftp = ssh_client.open_sftp()
+                        try:
+                            attrs = sftp.listdir_attr(path)
+                            entries = []
+                            for attr in attrs:
+                                mode = int(getattr(attr, "st_mode", 0) or 0)
+                                entries.append({
+                                    "name": getattr(attr, "filename", ""),
+                                    "path": posixpath.join(path, getattr(attr, "filename", "")),
+                                    "size": int(getattr(attr, "st_size", 0) or 0),
+                                    "mtime": int(getattr(attr, "st_mtime", 0) or 0),
+                                    "mode": mode,
+                                    "is_dir": stat.S_ISDIR(mode),
+                                    "is_symlink": stat.S_ISLNK(mode),
+                                })
+
+                            # Sort: dirs first, then alpha
+                            entries.sort(key=lambda e: (not e.get("is_dir", False), e.get("name", "").lower()))
+                        finally:
+                            try:
+                                sftp.close()
+                            except Exception:
+                                pass
+
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_list_result",
+                            "request_id": request_id,
+                            "success": True,
+                            "data": {
+                                "path": path,
+                                "entries": entries
+                            }
+                        }))
+                    except Exception as e:
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_list_result",
+                            "request_id": request_id,
+                            "success": False,
+                            "error": str(e)
+                        }))
+                elif message["type"] == "sftp_stat":
+                    request_id = message.get("request_id") or message.get("requestId")
+                    data = message.get("data") or {}
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    path_raw = data.get("path") or ""
+                    path = _sftp_resolve_path(path_raw, session_id, app.state.ssh_manager)
+
+                    try:
+                        sftp = ssh_client.open_sftp()
+                        try:
+                            attr = sftp.lstat(path)
+                            mode = int(getattr(attr, "st_mode", 0) or 0)
+                            payload = {
+                                "path": path,
+                                "size": int(getattr(attr, "st_size", 0) or 0),
+                                "mtime": int(getattr(attr, "st_mtime", 0) or 0),
+                                "mode": mode,
+                                "is_dir": stat.S_ISDIR(mode),
+                                "is_symlink": stat.S_ISLNK(mode),
+                            }
+                        finally:
+                            try:
+                                sftp.close()
+                            except Exception:
+                                pass
+
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_stat_result",
+                            "request_id": request_id,
+                            "success": True,
+                            "data": payload
+                        }))
+                    except Exception as e:
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_stat_result",
+                            "request_id": request_id,
+                            "success": False,
+                            "error": str(e)
+                        }))
+                elif message["type"] == "sftp_mkdir":
+                    request_id = message.get("request_id") or message.get("requestId")
+                    data = message.get("data") or {}
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    path_raw = data.get("path") or ""
+                    parents = bool(data.get("parents"))
+                    path = _sftp_resolve_path(path_raw, session_id, app.state.ssh_manager)
+
+                    try:
+                        sftp = ssh_client.open_sftp()
+                        try:
+                            if not parents:
+                                sftp.mkdir(path)
+                            else:
+                                # Recursive mkdir (best effort)
+                                parts = [p for p in path.split("/") if p]
+                                current = "/"
+                                for part in parts:
+                                    current = posixpath.join(current, part)
+                                    try:
+                                        sftp.stat(current)
+                                    except Exception:
+                                        sftp.mkdir(current)
+                        finally:
+                            try:
+                                sftp.close()
+                            except Exception:
+                                pass
+
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_mkdir_result",
+                            "request_id": request_id,
+                            "success": True,
+                            "data": {"path": path}
+                        }))
+                    except Exception as e:
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_mkdir_result",
+                            "request_id": request_id,
+                            "success": False,
+                            "error": str(e)
+                        }))
+                elif message["type"] == "sftp_rename":
+                    request_id = message.get("request_id") or message.get("requestId")
+                    data = message.get("data") or {}
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    old_path = _sftp_resolve_path(data.get("oldPath") or data.get("old") or "", session_id, app.state.ssh_manager)
+                    new_path = _sftp_resolve_path(data.get("newPath") or data.get("new") or "", session_id, app.state.ssh_manager)
+
+                    try:
+                        sftp = ssh_client.open_sftp()
+                        try:
+                            # posix_rename is atomic on POSIX servers when supported.
+                            try:
+                                sftp.posix_rename(old_path, new_path)
+                            except Exception:
+                                sftp.rename(old_path, new_path)
+                        finally:
+                            try:
+                                sftp.close()
+                            except Exception:
+                                pass
+
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_rename_result",
+                            "request_id": request_id,
+                            "success": True,
+                            "data": {"oldPath": old_path, "newPath": new_path}
+                        }))
+                    except Exception as e:
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_rename_result",
+                            "request_id": request_id,
+                            "success": False,
+                            "error": str(e)
+                        }))
+                elif message["type"] == "sftp_rm":
+                    request_id = message.get("request_id") or message.get("requestId")
+                    data = message.get("data") or {}
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    path = _sftp_resolve_path(data.get("path") or "", session_id, app.state.ssh_manager)
+                    recursive = bool(data.get("recursive"))
+
+                    def _rm_tree(sftp_client, target: str):
+                        try:
+                            attr = sftp_client.lstat(target)
+                        except Exception:
+                            return
+                        mode = int(getattr(attr, "st_mode", 0) or 0)
+                        if stat.S_ISDIR(mode):
+                            for child in sftp_client.listdir_attr(target):
+                                name = getattr(child, "filename", "")
+                                if not name or name in (".", ".."):
+                                    continue
+                                _rm_tree(sftp_client, posixpath.join(target, name))
+                            try:
+                                sftp_client.rmdir(target)
+                            except Exception:
+                                # Directory not empty / permission issues are surfaced upstream.
+                                raise
+                        else:
+                            sftp_client.remove(target)
+
+                    try:
+                        sftp = ssh_client.open_sftp()
+                        try:
+                            if recursive:
+                                _rm_tree(sftp, path)
+                            else:
+                                attr = sftp.lstat(path)
+                                mode = int(getattr(attr, "st_mode", 0) or 0)
+                                if stat.S_ISDIR(mode):
+                                    sftp.rmdir(path)
+                                else:
+                                    sftp.remove(path)
+                        finally:
+                            try:
+                                sftp.close()
+                            except Exception:
+                                pass
+
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_rm_result",
+                            "request_id": request_id,
+                            "success": True,
+                            "data": {"path": path}
+                        }))
+                    except Exception as e:
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_rm_result",
+                            "request_id": request_id,
+                            "success": False,
+                            "error": str(e)
+                        }))
+                elif message["type"] == "sftp_read":
+                    request_id = message.get("request_id") or message.get("requestId")
+                    data = message.get("data") or {}
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    path = _sftp_resolve_path(data.get("path") or "", session_id, app.state.ssh_manager)
+                    offset = int(data.get("offset") or 0)
+                    length = int(data.get("length") or 65536)
+                    # Keep chunks small to stay within websocket message limits.
+                    if length <= 0:
+                        length = 65536
+                    length = min(length, 65536)
+
+                    try:
+                        sftp = ssh_client.open_sftp()
+                        try:
+                            attr = sftp.stat(path)
+                            total_size = int(getattr(attr, "st_size", 0) or 0)
+                            with sftp.file(path, "rb") as f:
+                                if offset > 0:
+                                    f.seek(offset)
+                                chunk = f.read(length) or b""
+                        finally:
+                            try:
+                                sftp.close()
+                            except Exception:
+                                pass
+
+                        eof = (offset + len(chunk)) >= total_size
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_read_result",
+                            "request_id": request_id,
+                            "success": True,
+                            "data": {
+                                "path": path,
+                                "offset": offset,
+                                "length": len(chunk),
+                                "size": total_size,
+                                "eof": eof,
+                                "chunk_base64": base64.b64encode(chunk).decode("ascii")
+                            }
+                        }))
+                    except Exception as e:
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_read_result",
+                            "request_id": request_id,
+                            "success": False,
+                            "error": str(e)
+                        }))
+                elif message["type"] == "sftp_write":
+                    request_id = message.get("request_id") or message.get("requestId")
+                    data = message.get("data") or {}
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    path = _sftp_resolve_path(data.get("path") or "", session_id, app.state.ssh_manager)
+                    offset = int(data.get("offset") or 0)
+                    truncate = bool(data.get("truncate")) and offset == 0
+                    chunk_b64 = data.get("chunk_base64") or ""
+
+                    try:
+                        chunk = base64.b64decode(chunk_b64.encode("ascii")) if chunk_b64 else b""
+                    except Exception:
+                        chunk = b""
+
+                    try:
+                        sftp = ssh_client.open_sftp()
+                        try:
+                            try:
+                                f = sftp.file(path, "r+b")
+                            except Exception:
+                                f = sftp.file(path, "wb")
+
+                            with f:
+                                if truncate:
+                                    try:
+                                        f.truncate(0)
+                                    except Exception:
+                                        pass
+                                if offset > 0:
+                                    f.seek(offset)
+                                if chunk:
+                                    f.write(chunk)
+                        finally:
+                            try:
+                                sftp.close()
+                            except Exception:
+                                pass
+
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_write_result",
+                            "request_id": request_id,
+                            "success": True,
+                            "data": {
+                                "path": path,
+                                "offset": offset,
+                                "bytes_written": len(chunk)
+                            }
+                        }))
+                    except Exception as e:
+                        await websocket.send_text(json.dumps({
+                            "type": "sftp_write_result",
+                            "request_id": request_id,
+                            "success": False,
+                            "error": str(e)
+                        }))
                 elif message["type"] == "resize":
                     # 处理终端尺寸调整
                     if "data" in message and isinstance(message["data"], dict):
@@ -1275,6 +1879,8 @@ async def websocket_command_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     client_ip = None  # 安全：记录客户端IP
+    session_id = None
+    ssh_manager = None
     
     try:
         # === 安全检查：连接前验证 ===
@@ -1340,8 +1946,8 @@ async def websocket_command_endpoint(websocket: WebSocket):
         command = validated_cmd
         
         # 建立SSH连接
-        ssh_manager: SSHSessionManager = app.state.ssh_manager
-        ssh_client = ssh_manager.connect_ssh(connection)
+        ssh_manager = app.state.ssh_manager
+        ssh_client = ssh_manager.connect_ssh(session_id, connection)
         
         # 安全：记录连接
         security_logger.log_connection(client_ip, connection.hostname, connection.username, True)
@@ -1392,6 +1998,13 @@ async def websocket_command_endpoint(websocket: WebSocket):
         # === 安全清理 ===
         if client_ip:
             rate_limiter.remove_conn(client_ip)
+
+        # Close SSH client for this one-shot execute session
+        if ssh_manager and session_id:
+            try:
+                ssh_manager.disconnect_ssh(session_id)
+            except Exception:
+                pass
         
         # 尝试关闭WebSocket连接，但处理已关闭的情况
         try:
