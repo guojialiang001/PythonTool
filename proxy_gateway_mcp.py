@@ -1447,6 +1447,7 @@ async def proxy_handler(request: Request, path: str):
     
     # 校验必需的 headers
     headers_dict = {k.lower(): v for k, v in request.headers.items()}
+    logger.info(f"[{request_id}] Request origin header: '{headers_dict.get('origin', '')}'")
     is_valid, error_msg = validate_required_headers(headers_dict, request_id)
     if not is_valid:
         logger.warning(f"[{request_id}] ACCESS DENIED for path: {full_path}")
