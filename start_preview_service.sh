@@ -12,7 +12,7 @@ PYTHON_PATH="${PYTHON_PATH:-python3}"
 
 # Default config
 PREVIEW_HOST="${PREVIEW_HOST:-0.0.0.0}"
-PREVIEW_PORT="${PREVIEW_PORT:-8003}"
+PREVIEW_PORT="${PREVIEW_PORT:-8004}"
 
 export PREVIEW_HOST
 export PREVIEW_PORT
@@ -175,7 +175,7 @@ show_help() {
     echo ""
     echo "Environment:"
     echo "  PREVIEW_HOST (default: 0.0.0.0)"
-    echo "  PREVIEW_PORT (default: 8003)"
+    echo "  PREVIEW_PORT (default: 8004)"
     echo "  PREVIEW_TMP_DIR"
     echo "  PREVIEW_MAX_SIZE_MB"
     echo "  PREVIEW_TIMEOUT_SEC"
